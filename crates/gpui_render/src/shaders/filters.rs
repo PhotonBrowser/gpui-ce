@@ -7,7 +7,7 @@ pub mod surface {
     #[derive(Clone, Copy, Wgsl)]
     pub struct SurfaceUniforms {
         pub bounds: Bounds,
-        pub content_mask: Bounds,
+        pub content_mask: ContentMask,
         pub corner_radii: Corners,
         pub color_format: SurfaceColorFormat,
         pub opacity: f32,
@@ -60,7 +60,7 @@ pub mod surface {
             texture_position: vertex.unit_position,
             clip_distances: clip_distances(
                 vertex.viewport_position,
-                get!(SURFACE_LOCALS).content_mask,
+                get!(SURFACE_LOCALS).content_mask.bounds,
             ),
         }
     }
@@ -70,24 +70,25 @@ pub mod surface {
         if is_clipped(input.clip_distances) {
             return transparent();
         }
-        let corner_radii = get!(SURFACE_LOCALS).corner_radii;
+        let locals = get!(SURFACE_LOCALS);
+        let corner_radii = locals.corner_radii;
         let corner_coverage = antialiased_coverage(rounded_rectangle_signed_distance(
             input.position.xy(),
-            get!(SURFACE_LOCALS).bounds,
+            locals.bounds,
             corner_radii,
         ));
-        if get!(SURFACE_LOCALS).color_format == SurfaceColorFormat::Yuv {
-            return sample_yuv_surface(input.texture_position)
-                * get!(SURFACE_LOCALS).opacity
-                * corner_coverage;
+        let fade = ContentMask::alpha(locals.content_mask, input.position.xy());
+        let coverage = corner_coverage * fade;
+        if locals.color_format == SurfaceColorFormat::Yuv {
+            return sample_yuv_surface(input.texture_position) * locals.opacity * coverage;
         }
         texture_sample_level(
             SURFACE_TEXTURE,
             SURFACE_SAMPLER,
             input.texture_position,
             0.0,
-        ) * get!(SURFACE_LOCALS).opacity
-            * corner_coverage
+        ) * locals.opacity
+            * coverage
     }
 }
 

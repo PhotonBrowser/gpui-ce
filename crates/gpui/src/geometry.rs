@@ -12,6 +12,7 @@ use std::borrow::Cow;
 use std::ops::{AddAssign, Range};
 use std::{
     cmp::{self, PartialOrd},
+    f32::consts::GOLDEN_RATIO,
     fmt::{self, Display},
     hash::Hash,
     ops::{Add, Div, Mul, MulAssign, Neg, Sub},
@@ -1819,6 +1820,50 @@ impl<T: Clone + Debug + Default + PartialEq> Edges<T> {
             right: value.clone(),
             bottom: value.clone(),
             left: value,
+        }
+    }
+
+    /// Constructs `Edges` with the left and right sides set to the given value
+    /// and the top and bottom sides set to their default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::Edges;
+    /// let edges = Edges::horizontal(10.0);
+    /// assert_eq!(edges.top, 0.0);
+    /// assert_eq!(edges.right, 10.0);
+    /// assert_eq!(edges.bottom, 0.0);
+    /// assert_eq!(edges.left, 10.0);
+    /// ```
+    pub fn horizontal(value: T) -> Self {
+        Self {
+            top: T::default(),
+            right: value.clone(),
+            bottom: T::default(),
+            left: value,
+        }
+    }
+
+    /// Constructs `Edges` with the top and bottom sides set to the given value
+    /// and the left and right sides set to their default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use gpui::Edges;
+    /// let edges = Edges::vertical(10.0);
+    /// assert_eq!(edges.top, 10.0);
+    /// assert_eq!(edges.right, 0.0);
+    /// assert_eq!(edges.bottom, 10.0);
+    /// assert_eq!(edges.left, 0.0);
+    /// ```
+    pub fn vertical(value: T) -> Self {
+        Self {
+            top: value.clone(),
+            right: T::default(),
+            bottom: value,
+            left: T::default(),
         }
     }
 
@@ -3786,7 +3831,7 @@ pub const fn relative(fraction: f32) -> Relative {
 
 /// Returns the Golden Ratio, i.e. `~(1.0 + sqrt(5.0)) / 2.0`.
 pub const fn phi() -> Relative {
-    relative(1.618_034)
+    relative(GOLDEN_RATIO)
 }
 
 /// Constructs a `Rems` value representing a length in rems.

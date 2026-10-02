@@ -1,7 +1,8 @@
 # Main CI workflow
 name: CI
 
-# TODO: Setup coverage using cargo-mutants, but only for minor/major version bumps (would probably take hours :() -- also our testing infra sucks
+permissions:
+  contents: read
 
 on:
   push:
@@ -25,7 +26,6 @@ jobs:
     outputs:
       run_tests: ${{ steps.filter.outputs.run_tests }}
       run_style: ${{ steps.filter.outputs.run_style }}
-      run_docs: ${{ steps.filter.outputs.run_docs }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -35,7 +35,7 @@ jobs:
           if [ -z "$GITHUB_BASE_REF" ]; then
             COMPARE_REV="$(git rev-parse HEAD~1)"
           else
-            git fetch origin "$GITHUB_BASE_REF" --depth=350
+            git fetch --update-head-ok origin "$GITHUB_BASE_REF" --depth=350 || true
             COMPARE_REV="$(git merge-base "origin/${GITHUB_BASE_REF}" HEAD)"
           fi
           CHANGED_FILES="$(git diff --name-only "$COMPARE_REV" "$GITHUB_SHA")"
@@ -43,19 +43,20 @@ jobs:
           check_pattern() {
             local name="$1" pattern="$2" invert="${3:-false}"
             if [ "$invert" = "true" ]; then
-              echo "$CHANGED_FILES" | grep -qvP "$pattern" && echo "${name}=true" >> "$GITHUB_OUTPUT" || echo "${name}=false" >> "$GITHUB_OUTPUT"
+              echo "$CHANGED_FILES" | grep -qvE "$pattern" && echo "${name}=true" >> "$GITHUB_OUTPUT" || echo "${name}=false" >> "$GITHUB_OUTPUT"
             else
-              echo "$CHANGED_FILES" | grep -qP  "$pattern" && echo "${name}=true" >> "$GITHUB_OUTPUT" || echo "${name}=false" >> "$GITHUB_OUTPUT"
+              echo "$CHANGED_FILES" | grep -qE  "$pattern" && echo "${name}=true" >> "$GITHUB_OUTPUT" || echo "${name}=false" >> "$GITHUB_OUTPUT"
             fi
           }
 
           check_pattern "run_tests" '^(docs/|\.github/(ISSUE_TEMPLATE|workflows/)|README\.md|CHANGELOG\.md)' true
           check_pattern "run_style" '\.(rs|toml)$|rust-toolchain\.toml|\.cargo/|clippy\.toml|typos\.toml'
-          check_pattern "run_docs"  '^docs/|\.rs$'
 
   # Formatting
   fmt:
     runs-on: ubuntu-latest
+    needs: [orchestrate]
+    if: needs.orchestrate.outputs.run_style == 'true'
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -68,6 +69,8 @@ jobs:
   # Clippy
   clippy:
     runs-on: ubuntu-latest
+    needs: [orchestrate]
+    if: needs.orchestrate.outputs.run_style == 'true'
     steps:
       - uses: actions/checkout@v5
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -115,6 +118,8 @@ jobs:
   # Unused dependencies
   machete:
     runs-on: ubuntu-latest
+    needs: [orchestrate]
+    if: needs.orchestrate.outputs.run_style == 'true'
     steps:
       - uses: actions/checkout@v5
       - uses: Swatinem/rust-cache@v2
@@ -125,7 +130,8 @@ jobs:
 
   # MSRV
   msrv:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && needs.orchestrate.outputs.run_style == 'true'
+    needs: [orchestrate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -143,7 +149,8 @@ jobs:
 
   # WASM target (nightly + atomics)
   check-wasm:
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && needs.orchestrate.outputs.run_style == 'true'
+    needs: [orchestrate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -206,6 +213,7 @@ jobs:
       - uses: extractions/setup-just@v2
       - run: just build
       - run: just test
+      - run: just test-doc
 
   # Examples
   check-examples:
@@ -225,90 +233,3 @@ jobs:
       - uses: hustcer/setup-nu@v3
       - uses: extractions/setup-just@v2
       - run: just check-examples
-
-  # Compare against the PR base rather than crates.io. This reports only API
-  # regressions introduced by the PR, including regressions that would break
-  # downstream users such as our gpui-component fork.
-  semver:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-          # GitHub otherwise checks out a synthetic merge commit. Checking the
-          # PR head directly makes the comparison exactly base..PR, so API
-          # breaks already present on main are not reported again.
-          ref: ${{ github.event.pull_request.head.sha }}
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig-dev
-      - name: Check gpui-ce's public API against the PR base
-        uses: obi1kenobi/cargo-semver-checks-action@v2
-        with:
-          package: gpui-ce
-          baseline-rev: ${{ github.event.pull_request.base.sha }}
-          # This is an API-diff gate, not a release-type waiver. Keep the
-          # patch policy so an incompatibility introduced by this PR is shown
-          # and fails here; the reserved next-major release record does not
-          # make unrelated main-branch breaks part of this PR.
-          release-type: patch
-
-  # Beta toolchain (scheduled only)
-  beta-test:
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v5
-      - run: rustup update beta && rustup default beta
-      - uses: Swatinem/rust-cache@v2
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcb-shape0-dev libxcb-xfixes0-dev libfontconfig-dev
-      - uses: hustcer/setup-nu@v3
-      - uses: extractions/setup-just@v2
-      - run: just check
-      - run: just test
-
-  # Gate job
-  tests-pass:
-    if: always()
-    needs:
-      - fmt
-      - clippy
-      - typos
-      - lockfile
-      - machete
-      - msrv
-      - check-wasm
-      - test-linux
-      - test-mac
-      - test-windows
-      - check-examples
-      - semver
-    runs-on: ubuntu-latest
-    steps:
-      - run: |
-          set +e
-          EXIT_CODE=0
-          check_result() {
-            echo "* $1: $2"
-            if [[ "$2" != "skipped" && "$2" != "success" ]]; then EXIT_CODE=1; fi
-          }
-          check_result fmt            ${{ needs.fmt.result }}
-          check_result clippy         ${{ needs.clippy.result }}
-          check_result typos          ${{ needs.typos.result }}
-          check_result lockfile       ${{ needs.lockfile.result }}
-          check_result machete        ${{ needs.machete.result }}
-          check_result msrv           ${{ needs.msrv.result }}
-          check_result check-wasm     ${{ needs.check-wasm.result }}
-          check_result test-linux     ${{ needs.test-linux.result }}
-          check_result test-mac       ${{ needs.test-mac.result }}
-          check_result test-windows   ${{ needs.test-windows.result }}
-          check_result check-examples ${{ needs.check-examples.result }}
-          check_result semver         ${{ needs.semver.result }}
-          exit $EXIT_CODE

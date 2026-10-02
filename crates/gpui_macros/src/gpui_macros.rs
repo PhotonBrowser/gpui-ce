@@ -1,6 +1,7 @@
 mod bench;
 mod derive_action;
 mod derive_app_context;
+mod derive_element_traits;
 mod derive_into_element;
 mod derive_render;
 mod derive_visual_context;
@@ -34,6 +35,30 @@ pub fn register_action(ident: TokenStream) -> TokenStream {
 #[proc_macro_derive(IntoElement)]
 pub fn derive_into_element(input: TokenStream) -> TokenStream {
     derive_into_element::derive_into_element(input)
+}
+
+/// Implements `Styled` using the field marked `#[style]`.
+#[proc_macro_derive(Styled, attributes(style))]
+pub fn derive_styled(input: TokenStream) -> TokenStream {
+    derive_element_traits::derive_styled(input)
+}
+
+/// Implements `ParentElement` using the field marked `#[children]`.
+#[proc_macro_derive(ParentElement, attributes(children))]
+pub fn derive_parent_element(input: TokenStream) -> TokenStream {
+    derive_element_traits::derive_parent_element(input)
+}
+
+/// Implements `InteractiveElement` using the field marked `#[interactivity]`.
+#[proc_macro_derive(InteractiveElement, attributes(interactivity))]
+pub fn derive_interactive_element(input: TokenStream) -> TokenStream {
+    derive_element_traits::derive_interactive_element(input)
+}
+
+/// Implements the marker trait `StatefulInteractiveElement`.
+#[proc_macro_derive(StatefulInteractiveElement)]
+pub fn derive_stateful_interactive_element(input: TokenStream) -> TokenStream {
+    derive_element_traits::derive_stateful_interactive_element(input)
 }
 
 #[proc_macro_derive(Render)]

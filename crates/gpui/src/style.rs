@@ -243,6 +243,9 @@ pub struct Style {
     /// How children overflowing their container should affect layout
     #[refineable]
     pub overflow: Point<Overflow>,
+    /// Edge fade distances for overflow masking.
+    #[refineable]
+    pub overflow_fade: Edges<AbsoluteLength>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
     pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
@@ -829,9 +832,40 @@ impl Style {
                     (false, false) => Bounds::from_corners(min, max),
                 };
 
-                Some(ContentMask { bounds })
+                let mut fade_out = self.overflow_fade.to_pixels(rem_size);
+                if self.overflow.x == Overflow::Visible {
+                    fade_out.left = Pixels::ZERO;
+                    fade_out.right = Pixels::ZERO;
+                }
+                if self.overflow.y == Overflow::Visible {
+                    fade_out.top = Pixels::ZERO;
+                    fade_out.bottom = Pixels::ZERO;
+                }
+
+                Some(ContentMask { bounds, fade_out })
             }
         }
+    }
+
+    /// Get the content mask for a container that always clips and scrolls
+    /// vertically, like [`List`](crate::List) and
+    /// [`UniformList`](crate::UniformList): the vertical axis always clips,
+    /// the horizontal axis clips according to `overflow.x`, and
+    /// `overflow_fade` distances apply on each clipped axis.
+    pub fn scroll_mask(&self, bounds: Bounds<Pixels>, rem_size: Pixels) -> ContentMask<Pixels> {
+        let scroll_style = Style {
+            overflow: Point {
+                x: self.overflow.x,
+                y: Overflow::Scroll,
+            },
+            border_color: self.border_color,
+            border_widths: self.border_widths,
+            overflow_fade: self.overflow_fade,
+            ..Style::default()
+        };
+        scroll_style
+            .overflow_mask(bounds, rem_size)
+            .expect("vertical scrolling always clips")
     }
 
     /// Paints the background of an element styled with this style.
@@ -974,6 +1008,7 @@ impl Default for Style {
                 x: Overflow::Visible,
                 y: Overflow::Visible,
             },
+            overflow_fade: Edges::<AbsoluteLength>::zero(),
             allow_concurrent_scroll: false,
             restrict_scroll_to_axis: false,
             scrollbar_width: AbsoluteLength::default(),

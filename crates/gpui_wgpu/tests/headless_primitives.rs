@@ -18,6 +18,36 @@ const TARGET: Size<DevicePixels> = Size {
     height: DevicePixels(100),
 };
 
+#[test]
+fn filled_path_resolves_without_invalidating_the_frame() {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let mut scene = Scene::default();
+    scene.insert_primitive(Quad {
+        bounds: bounds(0.0, 0.0, 200.0, 100.0),
+        content_mask: full_mask(),
+        background: solid_background(gpui::black()),
+        ..Default::default()
+    });
+    let mut builder = gpui::PathBuilder::fill();
+    builder.move_to(gpui::point(gpui::px(20.0), gpui::px(20.0)));
+    builder.line_to(gpui::point(gpui::px(80.0), gpui::px(20.0)));
+    builder.line_to(gpui::point(gpui::px(50.0), gpui::px(80.0)));
+    builder.close();
+    let mut path = builder.build().expect("triangle").scale(1.0);
+    path.content_mask = full_mask();
+    path.color = solid_background(gpui::white());
+    scene.insert_primitive(path);
+    scene.finish();
+
+    // The path uses an MSAA attachment when supported. Storing that transient
+    // attachment invalidates the command buffer, including the background quad.
+    let image = renderer
+        .render_scene_to_image(&scene, TARGET)
+        .expect("valid path frame");
+    assert_eq!(image.get_pixel(50, 40).0, [255, 255, 255, 255]);
+    assert_eq!(image.get_pixel(150, 40).0, [0, 0, 0, 255]);
+}
+
 fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
     Bounds {
         origin: Point {
@@ -34,12 +64,14 @@ fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<ScaledPixels> {
 fn full_mask() -> ContentMask<ScaledPixels> {
     ContentMask {
         bounds: bounds(0.0, 0.0, 310.0, 100.0),
+        ..Default::default()
     }
 }
 
 fn mask(width: f32, height: f32) -> ContentMask<ScaledPixels> {
     ContentMask {
         bounds: bounds(0.0, 0.0, width, height),
+        ..Default::default()
     }
 }
 
@@ -505,4 +537,48 @@ fn smoothed_primitives_share_one_contour() {
             .save(std::env::temp_dir().join("gpui_smoothed_primitives.png"))
             .expect("save diagnostic image");
     }
+}
+
+#[test]
+fn content_mask_fades_quad_edges() {
+    let mut renderer = WgpuHeadlessRenderer::new().expect("headless renderer");
+    let mut scene = Scene::default();
+    let red: Hsla = gpui::rgb_to_hsla(gpui::rgb(0xff0000));
+    scene.insert_primitive(Quad {
+        order: 0,
+        bounds: bounds(0.0, 0.0, 310.0, 100.0),
+        content_mask: ContentMask {
+            bounds: bounds(0.0, 0.0, 100.0, 100.0),
+            fade_out: Edges {
+                top: ScaledPixels(10.0),
+                right: ScaledPixels(0.0),
+                bottom: ScaledPixels(0.0),
+                left: ScaledPixels(20.0),
+            },
+        },
+        background: solid_background(red),
+        ..Default::default()
+    });
+    scene.finish();
+    let image = renderer
+        .render_scene_to_image(&scene, TARGET)
+        .expect("render must succeed");
+    let pixel = |x: u32, y: u32| image.get_pixel(x, y).0;
+    let close = |x: u32, y: u32, red: u8| {
+        let actual = pixel(x, y)[0];
+        assert!(
+            actual.abs_diff(red) <= 3,
+            "at ({x},{y}) got {actual}, expected {red}"
+        );
+    };
+
+    // Fully inside both fades.
+    close(60, 50, 255);
+    // The ramp is evaluated at pixel centers (x + 0.5), so 10.5px into the
+    // 20px left fade is 52.5% coverage.
+    close(10, 50, 134);
+    // 2.5px into the 10px top fade is 25% coverage.
+    close(60, 2, 64);
+    // The unfaded right edge still clips hard at the mask boundary.
+    assert_eq!(pixel(101, 50)[0], 0);
 }
