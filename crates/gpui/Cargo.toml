@@ -128,7 +128,10 @@ subsecond = { version = "=0.7.10", optional = true }
 
 
 [target.'cfg(target_os = "macos")'.dependencies]
+core-foundation.workspace = true
 core-video.workspace = true
+io-surface = "0.16.1"
+metal.workspace = true
 core-text = "21"
 font-kit = { version = "0.14.1-zed", package = "zed-font-kit", optional = true }
 foreign-types = "0.5"

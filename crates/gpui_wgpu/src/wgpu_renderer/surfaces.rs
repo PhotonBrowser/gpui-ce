@@ -132,6 +132,7 @@ impl WgpuRenderer {
         let uniforms = SurfaceUniforms {
             bounds: surface.bounds.into(),
             content_mask: surface.content_mask.bounds.into(),
+            corner_radii: surface.corner_radii.into(),
             color_format,
             opacity,
             padding0: 0,

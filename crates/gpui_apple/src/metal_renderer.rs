@@ -3,9 +3,9 @@ use anyhow::Result;
 use block::ConcreteBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Bounds, Corners, DevicePixels, FilterRenderTarget, MAX_FILTER_GROUP_DEPTH,
-    MonochromeSprite, PaintSurface, Path, PolychromeSprite, PrimitiveBatch, Quad, RenderCommand,
-    ScaledPixels, Scene, Shadow, Size, SurfaceSource, Underline, size,
+    AtlasTextureId, Bounds, Corners, DevicePixels, ExternalTextureIdentity, FilterRenderTarget,
+    MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PaintSurface, Path, PolychromeSprite, PrimitiveBatch,
+    Quad, RenderCommand, ScaledPixels, Scene, Shadow, Size, SurfaceSource, Underline, size,
 };
 use gpui_render::{
     artifacts::{NATIVE_SHADERS, NativeShader},
@@ -24,8 +24,9 @@ use image::RgbaImage;
 
 use core_foundation::base::TCFType;
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    metal_texture::CVMetalTextureGetTexture,
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange},
 };
 use foreign_types::{ForeignType, ForeignTypeRef};
 use metal::{
@@ -38,6 +39,10 @@ use smallvec::SmallVec;
 use wgsl_rs::std::{vec2f, vec4f};
 
 use std::{cell::Cell, mem, ptr, sync::Arc};
+
+fn external_surface_trace_enabled() -> bool {
+    std::env::var_os("GPUI_EXTERNAL_SURFACE_TRACE").is_some()
+}
 
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
@@ -261,6 +266,10 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    external_surface_textures: std::collections::HashMap<
+        ExternalTextureIdentity,
+        core_video::metal_texture::CVMetalTexture,
+    >,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
@@ -328,6 +337,13 @@ impl MetalRenderer {
                 std::process::exit(1);
             })
         }
+    }
+
+    /// Returns the Metal device selected for layer-backed GPUI rendering.
+    /// Applications importing shared Metal resources can use this device to
+    /// verify cross-process identity and create compatible shared resources.
+    pub fn selected_device() -> metal::Device {
+        Self::create_device()
     }
 
     fn new_internal(
@@ -516,6 +532,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            external_surface_textures: std::collections::HashMap::new(),
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             scene_color_texture: None,
@@ -538,6 +555,11 @@ impl MetalRenderer {
             .as_ref()
             .map(|l| l.as_ptr())
             .unwrap_or(ptr::null_mut())
+    }
+
+    /// Registry identity of the Metal device used by this renderer.
+    pub fn device_registry_id(&self) -> u64 {
+        self.device.registry_id()
     }
 
     pub fn sprite_atlas(&self) -> &Arc<MetalAtlas> {
@@ -690,6 +712,18 @@ impl MetalRenderer {
         } else {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
+        }
+        if external_surface_trace_enabled() {
+            for surface in &scene.surfaces {
+                if let SurfaceSource::ExternalMetal(external) = &surface.source {
+                    eprintln!(
+                        "[GPUI-CE/ExternalMetal] drawable presentation queued; command buffer committed resource={} gen={} iosurface={}",
+                        external.descriptor.identity.resource_id,
+                        external.descriptor.identity.generation,
+                        external.descriptor.identity.iosurface_id
+                    );
+                }
+            }
         }
     }
 
@@ -895,6 +929,38 @@ impl MetalRenderer {
         self.prepare_intermediate_textures(scene, viewport_size);
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
+        // Wait on each producer fence in the command buffer that samples its
+        // IOSurface. This never blocks the AppKit or renderer thread.
+        for surface in &scene.surfaces {
+            if let SurfaceSource::ExternalMetal(external) = &surface.source {
+                if let Some(wait) = &external.wait {
+                    command_buffer.encode_wait_for_event(&wait.event, wait.value);
+                    if external_surface_trace_enabled() {
+                        eprintln!(
+                            "[GPUI-CE/ExternalMetal] wait encoded resource={} gen={} iosurface={} value={}",
+                            external.descriptor.identity.resource_id,
+                            external.descriptor.identity.generation,
+                            external.descriptor.identity.iosurface_id,
+                            wait.value
+                        );
+                    }
+                }
+                let external = external.clone();
+                let completion = ConcreteBlock::new(move |_| {
+                    let _keep_resource_alive_until_gpu_completion = &external.image_buffer;
+                    (external.on_gpu_complete)();
+                    if external_surface_trace_enabled() {
+                        eprintln!(
+                            "[GPUI-CE/ExternalMetal] command buffer completed resource={} gen={} iosurface={}",
+                            external.descriptor.identity.resource_id,
+                            external.descriptor.identity.generation,
+                            external.descriptor.identity.iosurface_id
+                        );
+                    }
+                });
+                command_buffer.add_completed_handler(&completion.copy());
+            }
+        }
         let alpha = if self.opaque { 1. } else { 0. };
         let mut instance_offset = 0;
         let scene_uniforms = SceneUniforms::new(viewport_size);
@@ -1803,6 +1869,114 @@ impl MetalRenderer {
         command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
 
         for (index, surface) in surfaces.iter().enumerate() {
+            if let SurfaceSource::ExternalMetal(external) = &surface.source {
+                let descriptor = external.descriptor;
+                if descriptor.pixel_format != kCVPixelFormatType_32BGRA
+                    || external.image_buffer.get_pixel_format() != kCVPixelFormatType_32BGRA
+                    || descriptor.size.width.0 as usize != external.image_buffer.get_width()
+                    || descriptor.size.height.0 as usize != external.image_buffer.get_height()
+                {
+                    log::error!("Metal external surface has an invalid BGRA descriptor");
+                    continue;
+                }
+                let texture = if let Some(texture) =
+                    self.external_surface_textures.get(&descriptor.identity)
+                {
+                    if external_surface_trace_enabled() {
+                        eprintln!(
+                            "[GPUI-CE/ExternalMetal] texture cache=hit resource={} gen={} iosurface={}",
+                            descriptor.identity.resource_id,
+                            descriptor.identity.generation,
+                            descriptor.identity.iosurface_id
+                        );
+                    }
+                    texture.clone()
+                } else {
+                    if external_surface_trace_enabled() {
+                        eprintln!(
+                            "[GPUI-CE/ExternalMetal] texture cache=miss import=begin resource={} gen={} iosurface={}",
+                            descriptor.identity.resource_id,
+                            descriptor.identity.generation,
+                            descriptor.identity.iosurface_id
+                        );
+                    }
+                    let imported = match self.core_video_texture_cache.create_texture_from_image(
+                        external.image_buffer.as_concrete_TypeRef(),
+                        None,
+                        MTLPixelFormat::BGRA8Unorm,
+                        descriptor.size.width.0 as usize,
+                        descriptor.size.height.0 as usize,
+                        0,
+                    ) {
+                        Ok(texture) => texture,
+                        Err(error) => {
+                            log::error!("failed to import external IOSurface: {error}");
+                            continue;
+                        }
+                    };
+                    self.external_surface_textures
+                        .insert(descriptor.identity, imported.clone());
+                    if external_surface_trace_enabled() {
+                        eprintln!(
+                            "[GPUI-CE/ExternalMetal] texture import=complete resource={} gen={} iosurface={}",
+                            descriptor.identity.resource_id,
+                            descriptor.identity.generation,
+                            descriptor.identity.iosurface_id
+                        );
+                    }
+                    imported
+                };
+
+                let surface_uniforms = SurfaceUniforms {
+                    bounds: surface.bounds.into(),
+                    content_mask: surface.content_mask.bounds.into(),
+                    corner_radii: surface.corner_radii.into(),
+                    color_format: SurfaceColorFormat::Rgba,
+                    opacity: opacities.get(index).copied().unwrap_or(1.0),
+                    padding0: 0,
+                    padding1: 0,
+                    padding2: 0,
+                    padding3: 0,
+                    padding4: 0,
+                    padding5: 0,
+                };
+                if external_surface_trace_enabled() {
+                    eprintln!(
+                        "[GPUI-CE/ExternalMetal] geometry resource={} gen={} bounds={:?} mask={:?} opacity={}",
+                        descriptor.identity.resource_id,
+                        descriptor.identity.generation,
+                        surface.bounds,
+                        surface.content_mask.bounds,
+                        opacities.get(index).copied().unwrap_or(1.0),
+                    );
+                }
+                command_encoder.set_vertex_bytes(
+                    DATA_SLOT,
+                    mem::size_of::<SurfaceUniforms>() as u64,
+                    &surface_uniforms as *const SurfaceUniforms as *const _,
+                );
+                command_encoder.set_fragment_bytes(
+                    DATA_SLOT,
+                    mem::size_of::<SurfaceUniforms>() as u64,
+                    &surface_uniforms as *const SurfaceUniforms as *const _,
+                );
+                command_encoder.set_fragment_texture(PRIMARY_TEXTURE_SLOT, unsafe {
+                    let texture = CVMetalTextureGetTexture(texture.as_concrete_TypeRef());
+                    Some(metal::TextureRef::from_ptr(texture as *mut _))
+                });
+                command_encoder.set_fragment_texture(SECONDARY_TEXTURE_SLOT, None);
+                command_encoder.draw_primitives(metal::MTLPrimitiveType::TriangleStrip, 0, 4);
+                if external_surface_trace_enabled() {
+                    eprintln!(
+                        "[GPUI-CE/ExternalMetal] draw encoded resource={} gen={} iosurface={}",
+                        descriptor.identity.resource_id,
+                        descriptor.identity.generation,
+                        descriptor.identity.iosurface_id
+                    );
+                }
+                continue;
+            }
+
             let image_buffer = match &surface.source {
                 SurfaceSource::Surface(image_buffer) => image_buffer,
                 SurfaceSource::Unsupported(size) => {
@@ -1849,6 +2023,7 @@ impl MetalRenderer {
             let surface_uniforms = SurfaceUniforms {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                corner_radii: surface.corner_radii.into(),
                 color_format: SurfaceColorFormat::Yuv,
                 opacity: opacities.get(index).copied().unwrap_or(1.0),
                 padding0: 0,

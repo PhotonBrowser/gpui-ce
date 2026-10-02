@@ -1214,6 +1214,7 @@ impl DirectXRenderer {
             let uniforms = SurfaceUniforms {
                 bounds: surface.bounds.into(),
                 content_mask: surface.content_mask.bounds.into(),
+                corner_radii: surface.corner_radii.into(),
                 color_format: SurfaceColorFormat::Rgba,
                 opacity: opacities.get(index).copied().unwrap_or(1.0),
                 padding0: 0,

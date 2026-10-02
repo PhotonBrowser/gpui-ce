@@ -337,6 +337,7 @@ mod tests {
                 content_mask: ContentMask {
                     bounds: bounds(4.0),
                 },
+                corner_radii: Corners::default(),
                 source,
             });
         }

@@ -5028,6 +5028,7 @@ impl Window {
         &mut self,
         bounds: Bounds<Pixels>,
         source: impl Into<crate::SurfaceSource>,
+        corner_radii: Corners<Pixels>,
     ) {
         use crate::PaintSurface;
 
@@ -5040,6 +5041,9 @@ impl Window {
                 order: 0,
                 bounds,
                 content_mask,
+                corner_radii: corner_radii
+                    .scale(self.scale_factor())
+                    .clamp_radii_for_quad_size(bounds.size),
                 source: source.into(),
             },
             self.element_opacity(),
