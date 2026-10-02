@@ -11,13 +11,13 @@ homepage = "https://gpui-ce.github.io/"
 readme = "README.md"
 keywords = ["desktop", "gui", "immediate"]
 categories = ["gui"]
-rust-version = "1.95" # required for Vec::push_mut
+rust-version = "1.95"                                                  # required for Vec::push_mut
 
 [lints]
 workspace = true
 
 [features]
-default = ["font-kit", "wayland", "x11", "windows-manifest"]
+default = ["wayland", "x11", "windows-manifest"]
 # Enables the opt-in custom WGPU control API on platforms that support shared
 # texture surfaces.
 custom-gpu = []
@@ -74,6 +74,7 @@ num_cpus = "1.13"
 parking = "2.0.0"
 parking_lot.workspace = true
 palette.workspace = true
+phf.workspace = true
 postage.workspace = true
 proptest = { workspace = true, optional = true }
 chrono.workspace = true
@@ -132,15 +133,10 @@ core-foundation.workspace = true
 core-video.workspace = true
 io-surface = "0.16.1"
 metal.workspace = true
-core-text = "21"
-font-kit = { version = "0.14.1-zed", package = "zed-font-kit", optional = true }
 foreign-types = "0.5"
 log.workspace = true
 objc2 = { workspace = true, optional = true }
 objc2-metal = { version = "0.3", optional = true }
-
-[target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
-
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { workspace = true, features = [
@@ -157,7 +153,7 @@ backtrace.workspace = true
 smol.workspace = true
 collections = { workspace = true, features = ["test-support"] }
 env_logger.workspace = true
-gpui_platform = { workspace = true, features = ["font-kit", "wayland", "x11"] }
+gpui_platform = { workspace = true, features = ["wayland", "x11"] }
 gpui_util = { workspace = true }
 lyon = { version = "1.0", features = ["extra"] }
 rand.workspace = true
@@ -177,20 +173,12 @@ embed-resource = { version = "3.0", optional = true }
 bindgen = "0.72"
 
 [package.metadata.cargo-shear]
-ignored = [
-  "bindgen",
-  "font-kit",
-  "getrandom",
-  "objc2",
-  "objc2-metal",
-  "tracing",
-]
+ignored = ["bindgen", "getrandom", "objc2", "objc2-metal", "tracing"]
 ignored-paths = ["src/_ownership_and_data_flow.rs"]
 
-# ============================================================================
+# =====================================================================
 # Learn Examples - Educational examples for learning GPUI
-# ============================================================================
-
+# =====================================================================
 [[example]]
 name = "interactive_elements"
 path = "examples/learn/interactive_elements.rs"
@@ -259,10 +247,9 @@ path = "examples/learn/corner_smoothing.rs"
 name = "keyring"
 path = "examples/learn/keyring.rs"
 
-# ============================================================================
+# =====================================================================
 # Bench Examples - Performance benchmarks
-# ============================================================================
-
+# =====================================================================
 [[example]]
 name = "data_table"
 path = "examples/bench/data_table.rs"
@@ -279,10 +266,9 @@ path = "examples/bench/pattern.rs"
 name = "shadow"
 path = "examples/bench/shadow.rs"
 
-# ============================================================================
+# =====================================================================
 # Legacy Examples - Original examples (to be updated)
-# ============================================================================
-
+# =====================================================================
 [[example]]
 name = "focus_visible"
 path = "examples/legacy/focus_visible.rs"
@@ -302,6 +288,10 @@ path = "examples/legacy/hello_world.rs"
 [[example]]
 name = "image_loading"
 path = "examples/legacy/image_loading.rs"
+
+[[example]]
+name = "inline_layout"
+path = "examples/legacy/inline_layout.rs"
 
 [[example]]
 name = "layer_shell"

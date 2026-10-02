@@ -2528,7 +2528,6 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         SmoothedPolychromeSprite,
-        EmojiRasterization,
         Surface,
         BlurDownsample,
         Blur,
@@ -2538,7 +2537,7 @@ pub(crate) mod shader_resources {
 
     impl ShaderModule {
         #[cfg(test)]
-        const ALL: [Self; 17] = [
+        const ALL: [Self; 16] = [
             Self::Quad,
             Self::SmoothedQuad,
             Self::Shadow,
@@ -2550,7 +2549,6 @@ pub(crate) mod shader_resources {
             Self::SubpixelSprite,
             Self::PolychromeSprite,
             Self::SmoothedPolychromeSprite,
-            Self::EmojiRasterization,
             Self::Surface,
             Self::BlurDownsample,
             Self::Blur,
@@ -2571,7 +2569,6 @@ pub(crate) mod shader_resources {
                 Self::SubpixelSprite => "subpixel_sprites",
                 Self::PolychromeSprite => "polychrome_sprites",
                 Self::SmoothedPolychromeSprite => "smoothed_polychrome_sprites",
-                Self::EmojiRasterization => "emoji_rasterization",
                 Self::Surface => "surfaces",
                 Self::BlurDownsample => "blur_downsample",
                 Self::Blur => "blur",

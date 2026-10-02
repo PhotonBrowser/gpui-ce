@@ -20,7 +20,6 @@ test-support = [
   "gpui_apple/test-support",
   "gpui_wgpu?/test-support",
 ]
-font-kit = ["dep:font-kit"]
 screen-capture = ["gpui/screen-capture", "dep:core-video"]
 # Draw windows with the WGPU renderer instead of Metal, so applications can
 # share its device and composite their own WGPU textures (with gpui's
@@ -46,12 +45,12 @@ core-video = { workspace = true, optional = true }
 ctor.workspace = true
 dispatch2 = "0.3.1"
 etagere.workspace = true
-font-kit = { version = "0.14.1-zed", package = "zed-font-kit", optional = true }
 foreign-types.workspace = true
 futures.workspace = true
 gpui_apple.workspace = true
 gpui_util.workspace = true
 gpui_wgpu = { workspace = true, optional = true }
+gpui_parley = { workspace = true, features = ["system-fonts"] }
 image.workspace = true
 itertools.workspace = true
 libc.workspace = true
@@ -68,7 +67,6 @@ objc2-screen-capture-kit.workspace = true
 objc2-user-notifications.workspace = true
 palette.workspace = true
 parking_lot.workspace = true
-pathfinder_geometry.workspace = true
 raw-window-handle.workspace = true
 semver.workspace = true
 smallvec.workspace = true

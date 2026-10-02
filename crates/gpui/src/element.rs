@@ -321,6 +321,7 @@ enum ElementDrawPhase<RequestLayoutState, PrepaintState> {
         bounds: Bounds<Pixels>,
         request_layout: RequestLayoutState,
         prepaint: PrepaintState,
+        inline_fragments: Option<Arc<[Bounds<Pixels>]>>,
     },
     Painted,
 }
@@ -465,6 +466,13 @@ impl<E: Element> Drawable<E> {
                 }
 
                 let node_id = window.next_frame.dispatch_tree.push_node();
+
+                let inline_fragments = window.inline_fragments(layout_id);
+                let previous_fragments = std::mem::replace(
+                    &mut window.current_inline_fragments,
+                    inline_fragments.clone(),
+                );
+
                 #[cfg(all(
                     feature = "hot-patching",
                     debug_assertions,
@@ -492,6 +500,8 @@ impl<E: Element> Drawable<E> {
                     window,
                     cx,
                 );
+
+                window.current_inline_fragments = previous_fragments;
                 window.next_frame.dispatch_tree.pop_node();
 
                 if pushed_a11y_node {
@@ -531,6 +541,7 @@ impl<E: Element> Drawable<E> {
                     bounds,
                     request_layout,
                     prepaint,
+                    inline_fragments,
                 };
             }
             _ => panic!("must call request_layout before prepaint"),
@@ -550,6 +561,7 @@ impl<E: Element> Drawable<E> {
                 bounds,
                 mut request_layout,
                 mut prepaint,
+                inline_fragments,
                 ..
             } => {
                 if let Some(element_id) = self.element.id() {
@@ -558,6 +570,10 @@ impl<E: Element> Drawable<E> {
                 }
 
                 window.next_frame.dispatch_tree.set_active_node(node_id);
+
+                let previous_fragments =
+                    std::mem::replace(&mut window.current_inline_fragments, inline_fragments);
+
                 #[cfg(all(
                     feature = "hot-patching",
                     debug_assertions,
@@ -592,6 +608,8 @@ impl<E: Element> Drawable<E> {
                     window.element_id_stack.pop();
                 }
 
+                window.current_inline_fragments = previous_fragments;
+
                 self.phase = ElementDrawPhase::Painted;
                 (request_layout, prepaint)
             }
@@ -599,12 +617,12 @@ impl<E: Element> Drawable<E> {
         }
     }
 
-    pub(crate) fn layout_as_root(
+    fn compute_layout_as_root(
         &mut self,
         available_space: Size<AvailableSpace>,
         window: &mut Window,
         cx: &mut App,
-    ) -> Size<Pixels> {
+    ) -> (LayoutId, Size<Pixels>) {
         if matches!(&self.phase, ElementDrawPhase::Start) {
             self.request_layout(window, cx);
         }
@@ -648,7 +666,17 @@ impl<E: Element> Drawable<E> {
             _ => panic!("cannot measure after painting"),
         };
 
-        window.layout_bounds(layout_id).size
+        (layout_id, window.layout_bounds(layout_id).size)
+    }
+
+    pub(crate) fn layout_as_root(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        window: &mut Window,
+        context: &mut App,
+    ) -> Size<Pixels> {
+        self.compute_layout_as_root(available_space, window, context)
+            .1
     }
 }
 
