@@ -36,9 +36,10 @@ use objc2::{
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSBackingStoreType, NSBeep, NSButton as Objc2NSButton,
     NSEventModifierFlags, NSEventType, NSRequestUserAttentionType, NSScreen, NSView as Objc2NSView,
-    NSViewLayerContentsRedrawPolicy, NSVisualEffectMaterial, NSVisualEffectState,
-    NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior,
-    NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton,
+    NSWindowCollectionBehavior, NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint as Objc2NSPoint, NSRange,
@@ -127,6 +128,7 @@ trait Objc2WindowMessages {
     unsafe fn visibleFrame(self) -> Objc2NSRect;
     unsafe fn styleMask(self) -> NSWindowStyleMask;
     unsafe fn contentView(self) -> ObjcId;
+    unsafe fn setContentView_(self, view: ObjcId);
     unsafe fn initWithContentRect_styleMask_backing_defer_screen_(
         self,
         frame: Objc2NSRect,
@@ -190,6 +192,9 @@ impl Objc2WindowMessages for ObjcId {
     }
     unsafe fn contentView(self) -> ObjcId {
         msg_send![self, contentView]
+    }
+    unsafe fn setContentView_(self, view: ObjcId) {
+        let _: () = msg_send![self, setContentView: view];
     }
     unsafe fn initWithContentRect_styleMask_backing_defer_screen_(
         self,
@@ -1885,36 +1890,48 @@ impl PlatformWindow for MacWindow {
 
         let opaque = background_appearance.is_opaque();
         this.renderer.update_transparency(!opaque);
+        let native_window = this.native_window;
+        let native_view = this.native_view.as_ptr() as ObjcId;
+        let old_blur_view = this.blurred_view;
+        // AppKit can call our view's setFrameSize: while changing its parent.
+        // That callback takes MacWindowState, so do not hold the lock here.
+        drop(this);
 
         unsafe {
-            this.native_window.setOpaque_(Bool::new(opaque));
+            native_window.setOpaque_(Bool::new(opaque));
             let background_color = if opaque {
                 msg_send![AnyClass::get(c"NSColor").unwrap(), colorWithSRGBRed: 0f64, green: 0f64, blue: 0f64, alpha: 1f64]
             } else {
                 // Not using `+[NSColor clearColor]` to avoid broken shadow.
                 msg_send![AnyClass::get(c"NSColor").unwrap(), colorWithSRGBRed: 0f64, green: 0f64, blue: 0f64, alpha: 0.0001]
             };
-            this.native_window.setBackgroundColor_(background_color);
+            native_window.setBackgroundColor_(background_color);
 
             if background_appearance != WindowBackgroundAppearance::Blurred {
-                if let Some(blur_view) = this.blurred_view {
-                    let _: () = msg_send![blur_view, removeFromSuperview];
-                    this.blurred_view = None;
+                if old_blur_view.is_some() {
+                    let _: ObjcId = msg_send![native_view, retain];
+                    let _: () = msg_send![native_view, removeFromSuperview];
+                    native_window.setContentView_(native_view);
+                    let _: () = msg_send![native_view, release];
+                    self.0.lock().blurred_view = None;
                 }
-            } else if this.blurred_view.is_none() {
-                let content_view = this.native_window.contentView();
+            } else if old_blur_view.is_none() {
+                let content_view = native_window.contentView();
                 let frame: Objc2NSRect = msg_send![content_view, bounds];
                 let mut blur_view: ObjcId = msg_send![&*BLURRED_VIEW_CLASS, alloc];
                 blur_view = msg_send![blur_view, initWithFrame: frame];
                 blur_view.setAutoresizingMask_(VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE);
 
-                let _: () = msg_send![
-                    content_view,
-                    addSubview: blur_view,
-                    positioned: NSWindowOrderingMode::Below,
-                    relativeTo: NIL
-                ];
-                this.blurred_view = Some(blur_view.autorelease());
+                // Use vibrancy as the window's content root so AppKit composites
+                // GPUI's transparent CAMetal view above the effect.
+                let _: ObjcId = msg_send![native_view, retain];
+                let _: () = msg_send![native_view, removeFromSuperview];
+                let _: () = msg_send![native_view, setFrame: frame];
+                let _: () = msg_send![native_view, setAutoresizingMask: VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE];
+                blur_view.addSubview_(native_view);
+                let _: () = msg_send![native_view, release];
+                native_window.setContentView_(blur_view);
+                self.0.lock().blurred_view = Some(blur_view.autorelease());
             }
         }
     }
@@ -3798,10 +3815,10 @@ unsafe extern "C" fn blurred_view_init_with_frame(
 ) -> ObjcId {
     unsafe {
         let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
-        // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::Selection];
-        let _: () = msg_send![view, setState: NSVisualEffectState::Active];
+        // This view backs transparent windows, so sample and blur content behind the window.
+        let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::UnderWindowBackground];
+        let _: () = msg_send![view, setBlendingMode: NSVisualEffectBlendingMode::BehindWindow];
+        let _: () = msg_send![view, setState: NSVisualEffectState::FollowsWindowActiveState];
         view
     }
 }
@@ -3811,12 +3828,12 @@ unsafe extern "C" fn blurred_view_update_layer(this: &Objc2Object, _: Sel) {
         let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
         let layer: ObjcId = msg_send![this, layer];
         if !layer.is_null() {
-            remove_layer_background(layer);
+            remove_layer_background(layer, true);
         }
     }
 }
 
-unsafe fn remove_layer_background(layer: ObjcId) {
+unsafe fn remove_layer_background(layer: ObjcId, is_root: bool) {
     unsafe {
         // `CALayer.setBackgroundColor:` takes a CGColorRef, not an Objective-C
         // object. Keep the null argument's type intact for objc2's runtime
@@ -3826,7 +3843,7 @@ unsafe fn remove_layer_background(layer: ObjcId) {
         }
 
         let class_name: ObjcId = msg_send![layer, className];
-        if class_name.isEqualToString("CAChameleonLayer").as_bool() {
+        if !is_root && class_name.isEqualToString("CAChameleonLayer").as_bool() {
             // Remove the desktop tinting effect.
             let _: () = msg_send![layer, setHidden: Bool::new(true)];
             return;
@@ -3866,7 +3883,7 @@ unsafe fn remove_layer_background(layer: ObjcId) {
             let count = msg_send![sublayers, count];
             for i in 0..count {
                 let sublayer = sublayers.objectAtIndex(i);
-                remove_layer_background(sublayer);
+                remove_layer_background(sublayer, false);
             }
         }
     }
