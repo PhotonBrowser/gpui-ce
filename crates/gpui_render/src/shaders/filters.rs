@@ -11,10 +11,10 @@ pub mod surface {
         pub corner_radii: Corners,
         pub color_format: SurfaceColorFormat,
         pub opacity: f32,
-        pub padding0: u32,
-        pub padding1: u32,
-        pub padding2: u32,
-        pub padding3: u32,
+        pub texture_u_min: f32,
+        pub texture_v_min: f32,
+        pub texture_u_max: f32,
+        pub texture_v_max: f32,
         pub padding4: u32,
         pub padding5: u32,
     }
@@ -79,15 +79,23 @@ pub mod surface {
         ));
         let fade = ContentMask::alpha(locals.content_mask, input.position.xy());
         let coverage = corner_coverage * fade;
+        let texture_position = vec2f(
+            mix(
+                locals.texture_u_min,
+                locals.texture_u_max,
+                input.texture_position.x(),
+            ),
+            mix(
+                locals.texture_v_min,
+                locals.texture_v_max,
+                input.texture_position.y(),
+            ),
+        );
         if locals.color_format == SurfaceColorFormat::Yuv {
-            return sample_yuv_surface(input.texture_position) * locals.opacity * coverage;
+            return sample_yuv_surface(texture_position) * locals.opacity * coverage;
         }
-        texture_sample_level(
-            SURFACE_TEXTURE,
-            SURFACE_SAMPLER,
-            input.texture_position,
-            0.0,
-        ) * locals.opacity
+        texture_sample_level(SURFACE_TEXTURE, SURFACE_SAMPLER, texture_position, 0.0)
+            * locals.opacity
             * coverage
     }
 }

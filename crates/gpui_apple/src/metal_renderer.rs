@@ -1881,6 +1881,10 @@ impl MetalRenderer {
                     || external.image_buffer.get_pixel_format() != kCVPixelFormatType_32BGRA
                     || descriptor.size.width.0 as usize != external.image_buffer.get_width()
                     || descriptor.size.height.0 as usize != external.image_buffer.get_height()
+                    || descriptor.visible_size.width.0 <= 0
+                    || descriptor.visible_size.height.0 <= 0
+                    || descriptor.visible_size.width.0 > descriptor.size.width.0
+                    || descriptor.visible_size.height.0 > descriptor.size.height.0
                 {
                     log::error!("Metal external surface has an invalid BGRA descriptor");
                     continue;
@@ -1924,10 +1928,14 @@ impl MetalRenderer {
                         .insert(descriptor.identity, imported.clone());
                     if external_surface_trace_enabled() {
                         eprintln!(
-                            "[GPUI-CE/ExternalMetal] texture import=complete resource={} gen={} iosurface={}",
+                            "[GPUI-CE/ExternalMetal] texture import=complete resource={} gen={} iosurface={} visible={}x{} backing={}x{}",
                             descriptor.identity.resource_id,
                             descriptor.identity.generation,
-                            descriptor.identity.iosurface_id
+                            descriptor.identity.iosurface_id,
+                            descriptor.visible_size.width.0,
+                            descriptor.visible_size.height.0,
+                            external.image_buffer.get_width(),
+                            external.image_buffer.get_height(),
                         );
                     }
                     imported
@@ -1935,14 +1943,16 @@ impl MetalRenderer {
 
                 let surface_uniforms = SurfaceUniforms {
                     bounds: surface.bounds.into(),
-                    content_mask: surface.content_mask.bounds.into(),
+                    content_mask: surface.content_mask.into(),
                     corner_radii: surface.corner_radii.into(),
                     color_format: SurfaceColorFormat::Rgba,
                     opacity: opacities.get(index).copied().unwrap_or(1.0),
-                    padding0: 0,
-                    padding1: 0,
-                    padding2: 0,
-                    padding3: 0,
+                    texture_u_min: 0.0,
+                    texture_v_min: 0.0,
+                    texture_u_max: descriptor.visible_size.width.0 as f32
+                        / descriptor.size.width.0 as f32,
+                    texture_v_max: descriptor.visible_size.height.0 as f32
+                        / descriptor.size.height.0 as f32,
                     padding4: 0,
                     padding5: 0,
                 };
@@ -2032,10 +2042,10 @@ impl MetalRenderer {
                 corner_radii: surface.corner_radii.into(),
                 color_format: SurfaceColorFormat::Yuv,
                 opacity: opacities.get(index).copied().unwrap_or(1.0),
-                padding0: 0,
-                padding1: 0,
-                padding2: 0,
-                padding3: 0,
+                texture_u_min: 0.0,
+                texture_v_min: 0.0,
+                texture_u_max: 1.0,
+                texture_v_max: 1.0,
                 padding4: 0,
                 padding5: 0,
             };

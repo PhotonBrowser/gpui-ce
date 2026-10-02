@@ -3818,7 +3818,12 @@ unsafe extern "C" fn blurred_view_update_layer(this: &Objc2Object, _: Sel) {
 
 unsafe fn remove_layer_background(layer: ObjcId) {
     unsafe {
-        let _: () = msg_send![layer, setBackgroundColor:NIL];
+        // `CALayer.setBackgroundColor:` takes a CGColorRef, not an Objective-C
+        // object. Keep the null argument's type intact for objc2's runtime
+        // encoding checks (otherwise blurred windows abort in updateLayer).
+        if let Some(layer) = layer.cast::<objc2_quartz_core::CALayer>().as_ref() {
+            layer.setBackgroundColor(None);
+        }
 
         let class_name: ObjcId = msg_send![layer, className];
         if class_name.isEqualToString("CAChameleonLayer").as_bool() {

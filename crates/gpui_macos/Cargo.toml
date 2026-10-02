@@ -63,6 +63,7 @@ objc2.workspace = true
 objc2-app-kit.workspace = true
 objc2-foundation.workspace = true
 objc2-core-media.workspace = true
+objc2-quartz-core.workspace = true
 objc2-screen-capture-kit.workspace = true
 objc2-user-notifications.workspace = true
 palette.workspace = true

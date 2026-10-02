@@ -116,8 +116,11 @@ pub struct ExternalTextureIdentity {
 pub struct ExternalSurfaceDescriptor {
     /// Identity, including the actual IOSurface ID.
     pub identity: ExternalTextureIdentity,
-    /// Dimensions in physical pixels.
+    /// Full texture dimensions in physical pixels.
     pub size: Size<DevicePixels>,
+    /// Visible top-left content dimensions. These can be smaller than `size`
+    /// while the producer reuses a larger IOSurface during resize.
+    pub visible_size: Size<DevicePixels>,
     /// CoreVideo/Metal pixel-format code.
     pub pixel_format: u32,
 }
@@ -183,6 +186,10 @@ impl ExternalMetalSurface {
         assert!(descriptor.size.width.0 > 0 && descriptor.size.height.0 > 0);
         assert_eq!(descriptor.size.width.0 as usize, image_buffer.get_width());
         assert_eq!(descriptor.size.height.0 as usize, image_buffer.get_height());
+        assert!(descriptor.visible_size.width.0 > 0);
+        assert!(descriptor.visible_size.height.0 > 0);
+        assert!(descriptor.visible_size.width.0 <= descriptor.size.width.0);
+        assert!(descriptor.visible_size.height.0 <= descriptor.size.height.0);
         use core_foundation::base::TCFType;
         use core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface;
         let surface = unsafe { CVPixelBufferGetIOSurface(image_buffer.as_concrete_TypeRef()) };
