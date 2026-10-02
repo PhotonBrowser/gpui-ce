@@ -143,6 +143,8 @@ pub struct ExternalMetalSurface {
     pub image_buffer: CVPixelBuffer,
     /// Optional producer fence.
     pub wait: Option<MetalSharedEventWait>,
+    /// Called immediately before a command buffer containing this surface is submitted.
+    pub on_gpu_submitted: Arc<dyn Fn() + Send + Sync>,
     /// Called after the GPU completes a command buffer sampling this resource.
     pub on_gpu_complete: Arc<dyn Fn() + Send + Sync>,
 }
@@ -173,6 +175,7 @@ impl ExternalMetalSurface {
         descriptor: ExternalSurfaceDescriptor,
         image_buffer: CVPixelBuffer,
         wait: Option<MetalSharedEventWait>,
+        on_gpu_submitted: impl Fn() + Send + Sync + 'static,
         on_gpu_complete: impl Fn() + Send + Sync + 'static,
     ) -> Self {
         assert_ne!(descriptor.identity.resource_id, 0);
@@ -198,6 +201,7 @@ impl ExternalMetalSurface {
             descriptor,
             image_buffer,
             wait,
+            on_gpu_submitted: Arc::new(on_gpu_submitted),
             on_gpu_complete: Arc::new(on_gpu_complete),
         }
     }

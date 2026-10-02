@@ -1253,6 +1253,12 @@ impl MetalRenderer {
             });
         }
 
+        for surface in &scene.surfaces {
+            if let SurfaceSource::ExternalMetal(external) = &surface.source {
+                (external.on_gpu_submitted)();
+            }
+        }
+
         Ok(command_buffer.to_owned())
     }
 
