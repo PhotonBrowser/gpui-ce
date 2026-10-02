@@ -3818,7 +3818,10 @@ unsafe extern "C" fn blurred_view_init_with_frame(
         // This view backs transparent windows, so sample and blur content behind the window.
         let _: () = msg_send![view, setMaterial: NSVisualEffectMaterial::UnderWindowBackground];
         let _: () = msg_send![view, setBlendingMode: NSVisualEffectBlendingMode::BehindWindow];
-        let _: () = msg_send![view, setState: NSVisualEffectState::FollowsWindowActiveState];
+        // Keep window vibrancy when the window loses focus. Following the window's
+        // active state makes blurred backgrounds become plain transparent windows
+        // while inactive.
+        let _: () = msg_send![view, setState: NSVisualEffectState::Active];
         view
     }
 }
