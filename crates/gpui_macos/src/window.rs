@@ -819,7 +819,7 @@ struct MacWindowState {
     background_executor: BackgroundExecutor,
     native_window: ObjcId,
     native_view: NonNull<Objc2Object>,
-    blurred_view: Option<ObjcId>,
+    backdrop_root: Option<ObjcId>,
     background_appearance: WindowBackgroundAppearance,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
@@ -1260,7 +1260,7 @@ impl MacWindow {
                 background_executor,
                 native_window,
                 native_view: NonNull::new_unchecked(native_view),
-                blurred_view: None,
+                backdrop_root: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
@@ -1886,13 +1886,14 @@ impl PlatformWindow for MacWindow {
 
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance) {
         let mut this = self.0.as_ref().lock();
+        let previous_appearance = this.background_appearance;
         this.background_appearance = background_appearance;
 
         let opaque = background_appearance.is_opaque();
         this.renderer.update_transparency(!opaque);
         let native_window = this.native_window;
         let native_view = this.native_view.as_ptr() as ObjcId;
-        let old_blur_view = this.blurred_view;
+        let old_backdrop_root = this.backdrop_root;
         // AppKit can call our view's setFrameSize: while changing its parent.
         // That callback takes MacWindowState, so do not hold the lock here.
         drop(this);
@@ -1907,31 +1908,66 @@ impl PlatformWindow for MacWindow {
             };
             native_window.setBackgroundColor_(background_color);
 
-            if background_appearance != WindowBackgroundAppearance::Blurred {
-                if old_blur_view.is_some() {
+            if previous_appearance != background_appearance {
+                if old_backdrop_root.is_some() {
                     let _: ObjcId = msg_send![native_view, retain];
                     let _: () = msg_send![native_view, removeFromSuperview];
                     native_window.setContentView_(native_view);
                     let _: () = msg_send![native_view, release];
-                    self.0.lock().blurred_view = None;
+                    self.0.lock().backdrop_root = None;
                 }
-            } else if old_blur_view.is_none() {
-                let content_view = native_window.contentView();
-                let frame: Objc2NSRect = msg_send![content_view, bounds];
-                let mut blur_view: ObjcId = msg_send![&*BLURRED_VIEW_CLASS, alloc];
-                blur_view = msg_send![blur_view, initWithFrame: frame];
-                blur_view.setAutoresizingMask_(VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE);
 
-                // Use vibrancy as the window's content root so AppKit composites
-                // GPUI's transparent CAMetal view above the effect.
-                let _: ObjcId = msg_send![native_view, retain];
-                let _: () = msg_send![native_view, removeFromSuperview];
-                let _: () = msg_send![native_view, setFrame: frame];
-                let _: () = msg_send![native_view, setAutoresizingMask: VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE];
-                blur_view.addSubview_(native_view);
-                let _: () = msg_send![native_view, release];
-                native_window.setContentView_(blur_view);
-                self.0.lock().blurred_view = Some(blur_view.autorelease());
+                let glass_class = if background_appearance
+                    == WindowBackgroundAppearance::LiquidGlass
+                    && is_macos_version_at_least(NSOperatingSystemVersion {
+                        majorVersion: 26,
+                        minorVersion: 0,
+                        patchVersion: 0,
+                    }) {
+                    AnyClass::get(c"NSGlassEffectView")
+                } else {
+                    None
+                };
+                if matches!(
+                    background_appearance,
+                    WindowBackgroundAppearance::Blurred | WindowBackgroundAppearance::LiquidGlass
+                ) {
+                    let content_view = native_window.contentView();
+                    let frame: Objc2NSRect = msg_send![content_view, bounds];
+                    // AppKit can resize the GPUI view synchronously as it moves between
+                    // parents. Keep the window-state lock released throughout.
+                    let _: ObjcId = msg_send![native_view, retain];
+                    let _: () = msg_send![native_view, removeFromSuperview];
+                    let _: () = msg_send![native_view, setFrame: frame];
+                    let _: () = msg_send![native_view, setAutoresizingMask: VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE];
+                    // A blur view sits behind the Metal view. Glass instead owns
+                    // its foreground through contentView; a sibling Metal view
+                    // is covered by AppKit's glass material.
+                    let mut backdrop_root: ObjcId = msg_send![class!(NSView), alloc];
+                    backdrop_root = msg_send![backdrop_root, initWithFrame: frame];
+                    let is_glass = glass_class.is_some();
+                    let effect_view = if let Some(glass_class) = glass_class {
+                        let mut glass_view: ObjcId = msg_send![glass_class, alloc];
+                        glass_view = msg_send![glass_view, initWithFrame: frame];
+                        let _: () = msg_send![glass_view, setContentView: native_view];
+                        // NSGlassEffectViewStyleRegular is zero in the AppKit SDK.
+                        let _: () = msg_send![glass_view, setStyle: 0 as NSInteger];
+                        glass_view
+                    } else {
+                        let mut blur_view: ObjcId = msg_send![&*BLURRED_VIEW_CLASS, alloc];
+                        blur_view = msg_send![blur_view, initWithFrame: frame];
+                        blur_view
+                    };
+                    effect_view.setAutoresizingMask_(VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE);
+                    backdrop_root.addSubview_(effect_view.autorelease());
+                    if !is_glass {
+                        backdrop_root.addSubview_(native_view);
+                    }
+                    let _: () = msg_send![native_view, release];
+                    backdrop_root.setAutoresizingMask_(VIEW_WIDTH_SIZABLE | VIEW_HEIGHT_SIZABLE);
+                    native_window.setContentView_(backdrop_root);
+                    self.0.lock().backdrop_root = Some(backdrop_root.autorelease());
+                }
             }
         }
     }

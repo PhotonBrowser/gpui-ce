@@ -2886,6 +2886,8 @@ pub enum WindowBackgroundAppearance {
     ///
     /// Not always supported.
     Blurred,
+    /// Native Liquid Glass on macOS 26 and later. Older systems use blur.
+    LiquidGlass,
     /// The Mica backdrop material, supported on Windows 11.
     MicaBackdrop,
     /// The Mica Alt backdrop material, supported on Windows 11.
@@ -2918,6 +2920,7 @@ mod window_background_appearance_tests {
         for appearance in [
             WindowBackgroundAppearance::Transparent,
             WindowBackgroundAppearance::Blurred,
+            WindowBackgroundAppearance::LiquidGlass,
             WindowBackgroundAppearance::MicaBackdrop,
             WindowBackgroundAppearance::MicaAltBackdrop,
         ] {
@@ -2941,6 +2944,8 @@ pub enum MacosWindowBackground {
     /// Transparency with the contents behind the window blurred, via the
     /// system's vibrancy materials.
     Blurred,
+    /// Native Liquid Glass on macOS 26 and later, with blurred vibrancy as a fallback.
+    LiquidGlass,
 }
 
 /// The background appearance of a Windows window, set through
@@ -2997,6 +3002,7 @@ impl From<MacosWindowBackground> for WindowBackgroundAppearance {
             MacosWindowBackground::Opaque => Self::Opaque,
             MacosWindowBackground::Transparent => Self::Transparent,
             MacosWindowBackground::Blurred => Self::Blurred,
+            MacosWindowBackground::LiquidGlass => Self::LiquidGlass,
         }
     }
 }
@@ -3049,6 +3055,10 @@ mod platform_window_background_tests {
         assert_eq!(
             WindowBackgroundAppearance::from(MacosWindowBackground::Blurred),
             WindowBackgroundAppearance::Blurred
+        );
+        assert_eq!(
+            WindowBackgroundAppearance::from(MacosWindowBackground::LiquidGlass),
+            WindowBackgroundAppearance::LiquidGlass
         );
     }
 
