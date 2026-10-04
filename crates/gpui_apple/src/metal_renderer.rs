@@ -457,7 +457,10 @@ impl MetalRenderer {
             MTLPixelFormat::BGRA8Unorm,
         );
         let (surfaces_shader, surfaces_library) = pipeline("surfaces");
-        let surfaces_pipeline_state = build_pipeline_state(
+        // External surfaces contain premultiplied pixels (including the BGRA
+        // IOSurfaces supplied by Photon). Blend their sampled colors without
+        // multiplying by alpha a second time.
+        let surfaces_pipeline_state = build_path_sprite_pipeline_state(
             &device,
             &surfaces_library,
             surfaces_shader,
