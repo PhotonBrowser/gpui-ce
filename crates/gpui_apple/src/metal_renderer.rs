@@ -1947,12 +1947,32 @@ impl MetalRenderer {
                     corner_radii: surface.corner_radii.into(),
                     color_format: SurfaceColorFormat::Rgba,
                     opacity: opacities.get(index).copied().unwrap_or(1.0),
-                    texture_u_min: 0.0,
-                    texture_v_min: 0.0,
-                    texture_u_max: descriptor.visible_size.width.0 as f32
-                        / descriptor.size.width.0 as f32,
-                    texture_v_max: descriptor.visible_size.height.0 as f32
-                        / descriptor.size.height.0 as f32,
+                    // Linear filtering samples outside a cropped region at its
+                    // edge. Keep resized IOSurface padding out of the samples
+                    // by mapping cropped axes from the first to last visible
+                    // texel centers. Full-size axes retain the normal 0..1 map.
+                    texture_u_min: if descriptor.visible_size.width < descriptor.size.width {
+                        0.5 / descriptor.size.width.0 as f32
+                    } else {
+                        0.0
+                    },
+                    texture_v_min: if descriptor.visible_size.height < descriptor.size.height {
+                        0.5 / descriptor.size.height.0 as f32
+                    } else {
+                        0.0
+                    },
+                    texture_u_max: if descriptor.visible_size.width < descriptor.size.width {
+                        (descriptor.visible_size.width.0 as f32 - 0.5)
+                            / descriptor.size.width.0 as f32
+                    } else {
+                        1.0
+                    },
+                    texture_v_max: if descriptor.visible_size.height < descriptor.size.height {
+                        (descriptor.visible_size.height.0 as f32 - 0.5)
+                            / descriptor.size.height.0 as f32
+                    } else {
+                        1.0
+                    },
                     padding4: 0,
                     padding5: 0,
                 };
@@ -2468,6 +2488,109 @@ mod tests {
             Some(image)
         } else {
             None
+        }
+    }
+
+    #[test]
+    fn external_metal_surface_samples_visible_top_left_region() {
+        use core_foundation::{
+            base::{CFType, TCFType},
+            dictionary::CFDictionary,
+            string::CFString,
+        };
+        use core_video::pixel_buffer::{
+            CVPixelBuffer, CVPixelBufferKeys, kCVPixelFormatType_32BGRA,
+        };
+        use core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface;
+        use std::ffi::c_void;
+
+        #[link(name = "IOSurface", kind = "framework")]
+        unsafe extern "C" {
+            fn IOSurfaceGetID(surface: *const c_void) -> u32;
+        }
+
+        let empty_properties: CFDictionary<CFString, CFType> = CFDictionary::from_CFType_pairs(&[]);
+        let empty_properties =
+            unsafe { CFType::wrap_under_get_rule(empty_properties.as_CFTypeRef()) };
+        let iosurface_key =
+            unsafe { CFString::wrap_under_get_rule(CVPixelBufferKeys::IOSurfaceProperties.into()) };
+        let options = CFDictionary::from_CFType_pairs(&[(iosurface_key, empty_properties)]);
+        let image = CVPixelBuffer::new(kCVPixelFormatType_32BGRA, 4, 4, Some(&options)).unwrap();
+        assert_eq!(
+            image.lock_base_address(0),
+            core_video::r#return::kCVReturnSuccess
+        );
+        let bytes_per_row = image.get_bytes_per_row();
+        let base = unsafe { image.get_base_address().cast::<u8>() };
+        for y in 0..4 {
+            for x in 0..4 {
+                let color = if x < 2 && y < 2 {
+                    [0, 0, 255, 255] // red, BGRA
+                } else {
+                    [255, 0, 0, 255] // blue, BGRA
+                };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        color.as_ptr(),
+                        base.add(y * bytes_per_row + x * 4),
+                        color.len(),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            image.unlock_base_address(0),
+            core_video::r#return::kCVReturnSuccess
+        );
+
+        let io_surface = unsafe { CVPixelBufferGetIOSurface(image.as_concrete_TypeRef()) };
+        assert!(!io_surface.is_null());
+        let iosurface_id = unsafe { IOSurfaceGetID(io_surface.cast()) };
+        let external = gpui::ExternalMetalSurface::new(
+            gpui::ExternalSurfaceDescriptor {
+                identity: ExternalTextureIdentity {
+                    resource_id: 1,
+                    generation: 1,
+                    iosurface_id,
+                },
+                size: size(DevicePixels(4), DevicePixels(4)),
+                visible_size: size(DevicePixels(2), DevicePixels(2)),
+                pixel_format: kCVPixelFormatType_32BGRA,
+            },
+            image,
+            None,
+            || {},
+            || {},
+        );
+        let bounds = Bounds {
+            origin: gpui::point(ScaledPixels(0.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(4.0), ScaledPixels(4.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                ..Default::default()
+            },
+            corner_radii: Corners::default(),
+            source: SurfaceSource::ExternalMetal(external),
+        });
+        scene.finish();
+
+        let mut renderer = MetalHeadlessRenderer::new();
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                Size {
+                    width: DevicePixels(4),
+                    height: DevicePixels(4),
+                },
+            )
+            .unwrap();
+        for pixel in image.pixels() {
+            assert_eq!(pixel.0, [255, 0, 0, 255]);
         }
     }
 
