@@ -1,16 +1,17 @@
 use crate::{
     ActiveTooltip, AnyView, App, AppContext, Bounds, DispatchPhase, Element, ElementId,
     GlobalElementId, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, Size,
-    TextOverflow, TextRangeExt, TextRun, TextStyle, TextTransform, TooltipId, WhiteSpace, Window,
-    WrappedLine, WrappedLineLayout, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
+    LayoutId, LineLayout, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParagraphDirection, Pixels,
+    Point, ShapedText, ShapedTextLayout, SharedString, Size, TextAlign, TextLayoutOptions,
+    TextOverflow, TextRangeExt, TextRun, TextStyle, TextTransform, TooltipId, UnicodeBidi,
+    WhiteSpace, Window, px, register_tooltip_mouse_handlers, set_tooltip_on_window,
 };
 use anyhow::Context as _;
 use gpui_util::ResultExt;
 use smallvec::SmallVec;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::{Cell, Ref, RefCell},
     mem,
     ops::{Deref, DerefMut, Range},
     rc::Rc,
@@ -625,11 +626,11 @@ struct TextLayoutState {
 
 struct TextLayoutInner {
     len: usize,
-    document: Option<WrappedLine>,
+    document: Option<ShapedText>,
     line_height: Pixels,
-    wrap_width: Option<Pixels>,
     truncate_width: Option<Pixels>,
-    size: Option<Size<Pixels>>,
+    options: TextLayoutOptions,
+    size: Size<Pixels>,
     bounds: Option<Bounds<Pixels>>,
 }
 
@@ -785,22 +786,16 @@ pub struct TextLayoutTruncation {
 impl TextLayoutTruncation {
     /// Creates a truncation by using the overflow as the affix, given the provided width.
     fn overflow_width(text_overflow: TextOverflow, width: Option<Pixels>) -> Self {
-        match text_overflow {
-            TextOverflow::Truncate(s) => TextLayoutTruncation {
-                width,
-                affix: s,
-                source: TruncateFrom::End,
-            },
-            TextOverflow::TruncateStart(s) => TextLayoutTruncation {
-                width,
-                affix: s,
-                source: TruncateFrom::Start,
-            },
-            TextOverflow::TruncateMiddle(s) => TextLayoutTruncation {
-                width,
-                affix: s,
-                source: TruncateFrom::Middle,
-            },
+        let (affix, source) = match text_overflow {
+            TextOverflow::Truncate(affix) => (affix, TruncateFrom::End),
+            TextOverflow::TruncateStart(affix) => (affix, TruncateFrom::Start),
+            TextOverflow::TruncateMiddle(affix) => (affix, TruncateFrom::Middle),
+        };
+
+        Self {
+            width,
+            affix,
+            source,
         }
     }
 }
@@ -812,18 +807,21 @@ impl TextLayout {
         known_dimensions: Size<Option<Pixels>>,
         available_space: Size<crate::AvailableSpace>,
     ) -> Option<Pixels> {
-        use crate::AvailableSpace::*;
         match white_space {
-            // Text does not wrap, no max width
             WhiteSpace::Nowrap => None,
-            // If the text wraps, return the already calculated width.
-            WhiteSpace::Normal => known_dimensions.width.or(match available_space.width {
-                // Otherwise if the available space is a concrete value, then that is the width to wrap to.
-                Definite(x) => Some(x),
-                // If the wrapping is content-based, then there is no wrapping of text.
-                MaxContent | MinContent => None,
-            }),
+            WhiteSpace::Normal => Self::evaluate_alignment_width(known_dimensions, available_space),
         }
+    }
+
+    /// Evaluates the containing width used to align text independently of wrapping.
+    pub fn evaluate_alignment_width(
+        known_dimensions: Size<Option<Pixels>>,
+        available_space: Size<crate::AvailableSpace>,
+    ) -> Option<Pixels> {
+        known_dimensions.width.or(match available_space.width {
+            crate::AvailableSpace::Definite(width) => Some(width),
+            crate::AvailableSpace::MinContent | crate::AvailableSpace::MaxContent => None,
+        })
     }
 
     /// Evaluates how truncation should be applied if the text overflows the available space.
@@ -834,16 +832,8 @@ impl TextLayout {
     ) -> TextLayoutTruncation {
         match text_style.text_overflow.clone() {
             Some(text_overflow) => {
-                // Calculate the desired width, prioritizing the calculated dimensions,
-                // falling back on calculating a width from the available space and
-                // number of lines to clamp to via text style.
-                let width = known_dimensions.width.or(match available_space.width {
-                    crate::AvailableSpace::Definite(x) => match text_style.line_clamp {
-                        Some(max_lines) => Some(x * max_lines),
-                        None => Some(x),
-                    },
-                    _ => None,
-                });
+                // Overflow is checked against each visual row's available width.
+                let width = Self::evaluate_alignment_width(known_dimensions, available_space);
 
                 TextLayoutTruncation::overflow_width(text_overflow, width)
             }
@@ -855,6 +845,34 @@ impl TextLayout {
         }
     }
 
+    pub(crate) fn layout_options(
+        text_style: &TextStyle,
+        known_dimensions: Size<Option<Pixels>>,
+        available_space: Size<crate::AvailableSpace>,
+        resolved_direction: crate::ResolvedDirection,
+        unicode_bidi: UnicodeBidi,
+    ) -> (TextLayoutOptions, TextLayoutTruncation) {
+        let alignment_width = Self::evaluate_alignment_width(known_dimensions, available_space);
+        let direction = match unicode_bidi {
+            UnicodeBidi::Plaintext => ParagraphDirection::Auto,
+            _ => resolved_direction.into(),
+        };
+        let options = TextLayoutOptions {
+            wrap_width: match text_style.white_space {
+                WhiteSpace::Normal => alignment_width,
+                WhiteSpace::Nowrap => None,
+            },
+            line_clamp: text_style.line_clamp,
+            alignment_width,
+            text_align: text_style.text_align,
+            direction,
+            unicode_bidi,
+        };
+        let truncation = Self::evaluate_overflow(text_style, known_dimensions, available_space);
+
+        (options, truncation)
+    }
+
     /// Conditionally applies truncation to some text and outputs how the text should be displayed.
     pub fn apply_truncation<'runs>(
         text: SharedString,
@@ -864,6 +882,8 @@ impl TextLayout {
         wrap_width: Option<Pixels>,
         truncation: &TextLayoutTruncation,
         runs: &'runs [TextRun],
+        paragraph_direction: ParagraphDirection,
+        unicode_bidi: UnicodeBidi,
         window: &mut Window,
         cx: &mut App,
     ) -> (SharedString, Cow<'runs, [TextRun]>) {
@@ -880,6 +900,8 @@ impl TextLayout {
             &truncation.affix,
             runs,
             truncation.source,
+            paragraph_direction,
+            unicode_bidi,
             window,
         )
     }
@@ -918,31 +940,29 @@ impl TextLayout {
             let element_state = self.clone();
 
             move |known_dimensions, available_space, window, cx| {
-                let wrap_width = Self::evaluate_wrap_width(
-                    &text_style.white_space,
+                let unicode_bidi = window.resolved_unicode_bidi();
+                let (options, truncation) = Self::layout_options(
+                    &text_style,
                     known_dimensions,
                     available_space,
+                    window.resolved_direction(),
+                    unicode_bidi,
                 );
-
-                let truncation =
-                    Self::evaluate_overflow(&text_style, known_dimensions, available_space);
                 let truncate_width = truncation.width;
 
                 // Only use cached layout if:
-                // 1. We have a cached size
-                // 2. wrap_width matches (or both are None)
-                // 3. truncate_width is None (if truncate_width is Some, we need to re-layout
+                // 1. truncate_width is None (if truncate_width is Some, we need to re-layout
                 //    because the previous layout may have been computed without truncation)
-                // 4. the cached layout was not truncated (a truncated layout answers an
+                // 2. the cached layout was not truncated (a truncated layout answers an
                 //    unconstrained probe with the truncated size, which poisons intrinsic
                 //    sizing with whatever width some earlier measure pass happened to use)
+                // 3. the complete layout options match.
                 if let Some(text_layout) = element_state.0.layout.borrow().as_ref()
-                    && let Some(size) = text_layout.size
-                    && (wrap_width.is_none() || wrap_width == text_layout.wrap_width)
                     && truncate_width.is_none()
                     && text_layout.truncate_width.is_none()
+                    && text_layout.options == options
                 {
-                    return size;
+                    return text_layout.size;
                 }
 
                 let (text, runs) = Self::apply_truncation(
@@ -950,21 +970,17 @@ impl TextLayout {
                     &text_style,
                     font_size,
                     line_height,
-                    wrap_width,
+                    options.wrap_width,
                     &truncation,
                     &runs,
+                    options.direction,
+                    options.unicode_bidi,
                     window,
                     cx,
                 );
                 let document = window
                     .text_system()
-                    .shape_text(
-                        text,
-                        font_size,
-                        &runs,
-                        wrap_width,            // Wrap if we know the width.
-                        text_style.line_clamp, // Limit the number of lines if line_clamp is set.
-                    )
+                    .shape_text_with_options(text, font_size, &runs, options)
                     .log_err();
 
                 let size = document
@@ -984,9 +1000,9 @@ impl TextLayout {
                         document,
                         len,
                         line_height,
-                        wrap_width,
                         truncate_width,
-                        size: Some(size),
+                        options,
+                        size,
                         bounds: None,
                     });
 
@@ -1034,14 +1050,13 @@ impl TextLayout {
             .unwrap();
 
         let line_height = element_state.line_height;
-        let text_style = window.text_style();
         if let Some(document) = &element_state.document {
             document
                 .paint_background(
                     bounds.origin,
                     line_height,
-                    text_style.text_align,
-                    Some(bounds),
+                    TextAlign::Left,
+                    None,
                     window,
                     cx,
                 )
@@ -1050,8 +1065,8 @@ impl TextLayout {
                 .paint(
                     bounds.origin,
                     line_height,
-                    text_style.text_align,
-                    Some(bounds),
+                    TextAlign::Left,
+                    None,
                     window,
                     cx,
                 )
@@ -1059,17 +1074,20 @@ impl TextLayout {
         }
     }
 
+    fn measured(&self) -> Ref<'_, TextLayoutInner> {
+        Ref::map(self.0.layout.borrow(), |layout| {
+            layout.as_ref().expect("measurement has not been performed")
+        })
+    }
+
     /// Get the byte index into the input of the pixel position.
-    pub fn index_for_position(&self, mut position: Point<Pixels>) -> Result<usize, usize> {
-        let element_state = self.0.layout.borrow();
-        let element_state = element_state
-            .as_ref()
-            .expect("measurement has not been performed");
+    pub fn index_for_position(&self, pixel_point: Point<Pixels>) -> Result<usize, usize> {
+        let element_state = self.measured();
         let bounds = element_state
             .bounds
             .expect("prepaint has not been performed");
 
-        if position.y < bounds.top() {
+        if pixel_point.y < bounds.top() {
             return Err(0);
         }
 
@@ -1077,41 +1095,32 @@ impl TextLayout {
         let Some(document) = &element_state.document else {
             return Err(0);
         };
-        document.byte_index_for_pixel_point(position - bounds.origin, line_height)
+
+        document.byte_index_for_pixel_point(pixel_point - bounds.origin, line_height)
     }
 
     /// Get the pixel position for the given byte index.
-    pub fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
-        let element_state = self.0.layout.borrow();
-        let element_state = element_state
-            .as_ref()
-            .expect("measurement has not been performed");
+    pub fn position_for_index(&self, byte_index: usize) -> Option<Point<Pixels>> {
+        let element_state = self.measured();
         let bounds = element_state
             .bounds
             .expect("prepaint has not been performed");
         let line_height = element_state.line_height;
 
         let document = element_state.document.as_ref()?;
-        Some(bounds.origin + document.visual_position_for_byte_index(index, line_height)?)
+        Some(bounds.origin + document.visual_position_for_byte_index(byte_index, line_height)?)
     }
 
     /// Retrieve the layout for the line containing the given byte index.
-    pub fn line_layout_for_index(&self, index: usize) -> Option<Arc<WrappedLineLayout>> {
-        let element_state = self.0.layout.borrow();
-        let element_state = element_state
-            .as_ref()
-            .expect("measurement has not been performed");
+    pub fn line_layout_for_index(&self, index: usize) -> Option<Arc<ShapedTextLayout>> {
+        let element_state = self.measured();
         let document = element_state.document.as_ref()?;
         (index <= document.len()).then(|| document.layout.clone())
     }
 
     /// Retrieve all line layouts in source order.
-    pub fn line_layouts(&self) -> SmallVec<[Arc<WrappedLineLayout>; 1]> {
-        self.0
-            .layout
-            .borrow()
-            .as_ref()
-            .expect("measurement has not been performed")
+    pub fn line_layouts(&self) -> SmallVec<[Arc<ShapedTextLayout>; 1]> {
+        self.measured()
             .document
             .iter()
             .map(|document| document.layout.clone())
@@ -1120,26 +1129,22 @@ impl TextLayout {
 
     /// The bounds of this layout.
     pub fn bounds(&self) -> Bounds<Pixels> {
-        self.0.layout.borrow().as_ref().unwrap().bounds.unwrap()
+        self.measured().bounds.unwrap()
     }
 
     /// The line height for this layout.
     pub fn line_height(&self) -> Pixels {
-        self.0.layout.borrow().as_ref().unwrap().line_height
+        self.measured().line_height
     }
 
     /// The UTF-8 length of the underlying text.
     pub fn len(&self) -> usize {
-        self.0.layout.borrow().as_ref().unwrap().len
+        self.measured().len
     }
 
     /// The text for this layout.
     pub fn text(&self) -> String {
-        self.0
-            .layout
-            .borrow()
-            .as_ref()
-            .unwrap()
+        self.measured()
             .document
             .as_ref()
             .map_or_else(String::new, |document| document.text.to_string())
@@ -1148,8 +1153,9 @@ impl TextLayout {
     /// The text for this layout (with soft-wraps as newlines)
     pub fn wrapped_text(&self) -> String {
         let mut accumulator = String::new();
+        let element_state = self.measured();
 
-        if let Some(document) = &self.0.layout.borrow().as_ref().unwrap().document {
+        if let Some(document) = &element_state.document {
             for visual_line in document.layout.visual_lines() {
                 accumulator.push_str(&document.text[visual_line.text_range.clone()]);
                 accumulator.push('\n');
@@ -1170,27 +1176,28 @@ fn truncate_to_shaped_layout<'a>(
     affix: &str,
     runs: &'a [TextRun],
     direction: TruncateFrom,
+    paragraph_direction: ParagraphDirection,
+    unicode_bidi: UnicodeBidi,
     window: &mut Window,
 ) -> (SharedString, Cow<'a, [TextRun]>) {
-    let fits = |candidate: &str, candidate_runs: &[TextRun], window: &mut Window| {
-        let Ok(document) = window.text_system().shape_text(
-            SharedString::from(candidate.to_owned()),
-            font_size,
-            candidate_runs,
-            wrap_width,
-            None,
-        ) else {
-            return false;
-        };
-        let width = wrap_width.unwrap_or(truncate_width);
-        max_lines.is_none_or(|max_lines| document.line_count() <= max_lines.max(1))
-            && document
-                .visual_lines()
-                .iter()
-                .all(|visual| visual.advance_width <= width + px(0.01))
+    let options = TextLayoutOptions {
+        wrap_width,
+        direction: paragraph_direction,
+        unicode_bidi,
+        text_align: TextAlign::Left,
+        ..Default::default()
     };
+    let Ok(document) =
+        window
+            .text_system()
+            .shape_text_with_options(text.clone(), font_size, runs, options)
+    else {
+        return (text, Cow::Borrowed(runs));
+    };
+    let width = wrap_width.unwrap_or(truncate_width);
+    let fits = text_layout_fits(&document.layout.layout, width, max_lines);
 
-    if fits(&text, runs, window) {
+    if fits {
         return (text, Cow::Borrowed(runs));
     }
 
@@ -1200,136 +1207,364 @@ fn truncate_to_shaped_layout<'a>(
         .collect::<Vec<_>>();
     boundaries.push(text.len());
     let grapheme_count = boundaries.len().saturating_sub(1);
-    let candidate =
-        |keep| make_truncation_candidate(&text, &boundaries, keep, affix, runs, direction);
+    let grapheme_ranges = boundaries
+        .windows(2)
+        .map(|boundary| boundary[0]..boundary[1])
+        .collect::<Vec<_>>();
+    let grapheme_widths = document
+        .platform_layout
+        .inline_geometry_for_ranges(&grapheme_ranges)
+        .into_iter()
+        .map(|regions| {
+            regions
+                .into_iter()
+                .map(|geometry| geometry.bounds.size.width)
+                .sum::<Pixels>()
+        })
+        .collect::<Vec<_>>();
+    let mut prefix_widths = Vec::with_capacity(grapheme_widths.len() + 1);
+    prefix_widths.push(Pixels::ZERO);
+    for width in &grapheme_widths {
+        prefix_widths.push(prefix_widths.last().copied().unwrap_or_default() + *width);
+    }
 
-    let mut low = 0usize;
-    let mut high = grapheme_count.saturating_sub(1);
-    while low < high {
-        let middle = low + (high - low).div_ceil(2);
-        let (candidate_text, candidate_runs) = candidate(middle);
-        if fits(&candidate_text, &candidate_runs, window) {
-            low = middle;
-        } else {
-            high = middle - 1;
+    let affix_width = if affix.is_empty() {
+        Pixels::ZERO
+    } else {
+        let candidate = make_truncation_candidate(
+            &text,
+            &TruncationBoundaries::new(boundaries.iter().copied(), grapheme_count),
+            0,
+            affix,
+            runs,
+            direction,
+        );
+
+        window
+            .text_system()
+            .shape_text_with_options(
+                SharedString::from(affix),
+                font_size,
+                &candidate.runs,
+                TextLayoutOptions {
+                    wrap_width: None,
+                    ..options
+                },
+            )
+            .map_or(Pixels::ZERO, |layout| layout.width())
+    };
+    let available_width = (width - affix_width).max(Pixels::ZERO);
+
+    let keep = if direction == TruncateFrom::End
+        && let (Some(wrap_width), Some(max_lines)) = (wrap_width, max_lines)
+    {
+        let last_line_idx = max_lines.max(1).saturating_sub(1);
+        let line_start = document
+            .visual_lines()
+            .get(last_line_idx)
+            .map_or(0, |line| line.text_range.start);
+        let fixed_count = grapheme_ranges.partition_point(|range| range.end <= line_start);
+        fixed_count
+            + grapheme_widths[fixed_count..]
+                .iter()
+                .scan(Pixels::ZERO, |used, advance| {
+                    *used += *advance;
+                    Some(*used <= (wrap_width - affix_width).max(Pixels::ZERO))
+                })
+                .take_while(|fits| *fits)
+                .count()
+    } else {
+        (0..grapheme_count)
+            .take_while(|keep| {
+                let candidate_count = keep + 1;
+                let width: Pixels = match direction {
+                    TruncateFrom::End => prefix_widths[candidate_count],
+                    TruncateFrom::Start => {
+                        prefix_widths[grapheme_count]
+                            - prefix_widths[grapheme_count - candidate_count]
+                    }
+                    TruncateFrom::Middle => {
+                        let front_count = candidate_count.saturating_mul(2).div_ceil(3);
+                        let back_count = candidate_count - front_count;
+                        prefix_widths[front_count] + prefix_widths[grapheme_count]
+                            - prefix_widths[grapheme_count - back_count]
+                    }
+                };
+
+                width <= available_width
+            })
+            .count()
+    };
+
+    let (candidate, ()) = truncate_with_measured_candidates(
+        &text,
+        boundaries.iter().copied(),
+        Some(keep),
+        affix,
+        runs,
+        direction,
+        |candidate| {
+            let fits = window
+                .text_system()
+                .shape_text_with_options(
+                    candidate.text.clone(),
+                    font_size,
+                    &candidate.runs,
+                    options,
+                )
+                .is_ok_and(|document| text_layout_fits(&document.layout.layout, width, max_lines));
+
+            ((), fits)
+        },
+    );
+
+    (candidate.text, Cow::Owned(candidate.runs))
+}
+
+pub(crate) fn text_layout_fits(
+    layout: &LineLayout,
+    width: Pixels,
+    max_lines: Option<usize>,
+) -> bool {
+    max_lines.is_none_or(|count| layout.platform_layout.line_count() <= count.max(1))
+        && layout.platform_layout.size().width <= width + px(0.01)
+}
+
+pub(crate) struct TruncationCandidate {
+    pub text: SharedString,
+    pub runs: Vec<TextRun>,
+    retained: SmallVec<[(Range<usize>, usize); 2]>,
+    affix_range: Range<usize>,
+    affix_source: usize,
+}
+
+impl TruncationCandidate {
+    pub(crate) fn display_ranges(&self, source: &Range<usize>) -> SmallVec<[Range<usize>; 3]> {
+        let mut ranges: SmallVec<[Range<usize>; 3]> = SmallVec::new();
+
+        for (retained, display_start) in &self.retained {
+            let start = source.start.max(retained.start);
+            let end = source.end.min(retained.end);
+
+            if start < end {
+                ranges.push(
+                    start - retained.start + display_start..end - retained.start + display_start,
+                );
+            }
+        }
+
+        if source.contains(&self.affix_source) && !self.affix_range.is_empty() {
+            ranges.push(self.affix_range.clone());
+        }
+
+        ranges.sort_by_key(|range| range.start);
+
+        ranges
+    }
+}
+
+/// Keeps independent prefix and suffix iterators because middle truncation moves
+/// their cuts in opposite directions. Narrowing them with the candidate search
+/// limits rescanning without collecting offsets into a vector. Bounds remain
+/// inclusive so adjacent middle candidates can reuse the same cut.
+struct TruncationBoundaries<Boundaries> {
+    grapheme_count: usize,
+    front: BoundaryWindow<Boundaries>,
+    back: BoundaryWindow<Boundaries>,
+}
+
+impl<Boundaries: DoubleEndedIterator<Item = usize> + Clone> TruncationBoundaries<Boundaries> {
+    fn new(boundaries: Boundaries, grapheme_count: usize) -> Self {
+        Self {
+            grapheme_count,
+            front: BoundaryWindow {
+                boundaries: boundaries.clone(),
+                first: 0,
+                last: grapheme_count,
+            },
+            back: BoundaryWindow {
+                boundaries,
+                first: 0,
+                last: grapheme_count,
+            },
         }
     }
-    let (result, result_runs) = candidate(low);
-    (result, Cow::Owned(result_runs))
+
+    fn narrow(&mut self, keep: usize, direction: TruncateFrom, fits: bool) {
+        let (front_count, back_count) = match direction {
+            TruncateFrom::End => (keep, 0),
+            TruncateFrom::Start => (0, keep),
+            TruncateFrom::Middle => {
+                let front_count = keep.saturating_mul(2).div_ceil(3);
+
+                (front_count, keep - front_count)
+            }
+        };
+
+        if direction != TruncateFrom::Start {
+            if fits {
+                self.front.retain_after(front_count);
+            } else {
+                self.front.retain_before(front_count);
+            }
+        }
+
+        if direction != TruncateFrom::End {
+            let back_index = self.grapheme_count - back_count;
+
+            if fits {
+                self.back.retain_before(back_index);
+            } else {
+                self.back.retain_after(back_index);
+            }
+        }
+    }
+}
+
+struct BoundaryWindow<Boundaries> {
+    boundaries: Boundaries,
+    first: usize,
+    last: usize,
+}
+
+impl<Boundaries: DoubleEndedIterator<Item = usize> + Clone> BoundaryWindow<Boundaries> {
+    fn get(&self, index: usize) -> usize {
+        let from_start = index - self.first;
+        let from_end = self.last - index;
+
+        if from_start <= from_end {
+            self.boundaries.clone().nth(from_start)
+        } else {
+            self.boundaries.clone().nth_back(from_end)
+        }
+        .expect("grapheme boundary is present")
+    }
+
+    fn retain_after(&mut self, index: usize) {
+        if index > self.first {
+            let _boundary = self.boundaries.nth(index - self.first - 1);
+            self.first = index;
+        }
+    }
+
+    fn retain_before(&mut self, index: usize) {
+        if index < self.last {
+            let _boundary = self.boundaries.nth_back(self.last - index - 1);
+            self.last = index;
+        }
+    }
+}
+
+/// Keeps the measured candidate with its output. Even an estimated starting point must fit.
+pub(crate) fn truncate_with_measured_candidates<Layout>(
+    text: &str,
+    boundaries: impl DoubleEndedIterator<Item = usize> + Clone,
+    initial_keep: Option<usize>,
+    affix: &str,
+    runs: &[TextRun],
+    direction: TruncateFrom,
+    mut measure: impl FnMut(&TruncationCandidate) -> (Layout, bool),
+) -> (TruncationCandidate, Layout) {
+    let boundary_count = boundaries.clone().count();
+    let grapheme_count = boundary_count.saturating_sub(1);
+    let mut boundaries = TruncationBoundaries::new(boundaries, grapheme_count);
+
+    let mut lower = 0;
+    let mut upper = boundary_count.saturating_sub(2);
+    let mut keep = initial_keep.unwrap_or(boundary_count / 2).min(upper);
+    let mut best = None;
+
+    loop {
+        let candidate = make_truncation_candidate(text, &boundaries, keep, affix, runs, direction);
+        let (layout, fits) = measure(&candidate);
+
+        if fits {
+            best = Some((candidate, layout));
+            lower = keep + 1;
+        } else if keep == 0 {
+            // Preserve the requested marker when even the marker alone is too wide.
+            return best.unwrap_or((candidate, layout));
+        } else {
+            upper = keep - 1;
+        }
+
+        if lower > upper {
+            return best.expect("a fitting candidate was measured");
+        }
+
+        boundaries.narrow(keep, direction, fits);
+        keep = lower + (upper - lower) / 2;
+    }
 }
 
 fn make_truncation_candidate(
     text: &str,
-    boundaries: &[usize],
+    boundaries: &TruncationBoundaries<impl DoubleEndedIterator<Item = usize> + Clone>,
     keep: usize,
     affix: &str,
     runs: &[TextRun],
     direction: TruncateFrom,
-) -> (SharedString, Vec<TextRun>) {
-    let grapheme_count = boundaries.len().saturating_sub(1);
+) -> TruncationCandidate {
+    let grapheme_count = boundaries.grapheme_count;
     let keep = keep.min(grapheme_count);
-    let mut candidate_runs = runs.to_vec();
-    match direction {
+    let (front_end, back_start, affix_source) = match direction {
         TruncateFrom::End => {
-            let end = boundaries[keep];
-            let prefix = text[..end]
+            let prefix = text[..boundaries.front.get(keep)]
                 .trim_end_matches(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation());
-            let result = SharedString::from(format!("{prefix}{affix}"));
-            update_runs_after_truncation(&result, affix, &mut candidate_runs, direction);
-            (result, candidate_runs)
+            let end = prefix.len();
+
+            (end, text.len(), end.min(text.len().saturating_sub(1)))
         }
         TruncateFrom::Start => {
-            let start = boundaries[grapheme_count - keep];
-            let result = SharedString::from(format!("{affix}{}", &text[start..]));
-            update_runs_after_truncation(&result, affix, &mut candidate_runs, direction);
-            (result, candidate_runs)
+            let start = boundaries.back.get(grapheme_count - keep);
+
+            (0, start, start.saturating_sub(1))
         }
         TruncateFrom::Middle => {
             let front_count = keep.saturating_mul(2).div_ceil(3);
             let back_count = keep - front_count;
-            let front_end = boundaries[front_count];
-            let back_start = boundaries[grapheme_count - back_count];
-            let result = SharedString::from(format!(
-                "{}{affix}{}",
-                &text[..front_end],
-                &text[back_start..]
+            let end = boundaries.front.get(front_count);
+
+            (
+                end,
+                boundaries.back.get(grapheme_count - back_count),
+                end.saturating_sub(1),
+            )
+        }
+    };
+
+    let mut candidate = TruncationCandidate {
+        text: format!("{}{affix}{}", &text[..front_end], &text[back_start..]).into(),
+        runs: Vec::new(),
+        retained: SmallVec::from_buf([
+            (0..front_end, 0),
+            (back_start..text.len(), front_end + affix.len()),
+        ]),
+        affix_range: front_end..front_end + affix.len(),
+        affix_source,
+    };
+    let mut offset = 0;
+    let mut display_runs = Vec::new();
+
+    for run in runs {
+        let source = offset..offset + run.len;
+        offset = source.end;
+
+        for range in candidate.display_ranges(&source) {
+            display_runs.push((
+                range.start,
+                TextRun {
+                    len: range.len(),
+                    ..run.clone()
+                },
             ));
-            update_runs_after_middle_truncation(affix, &mut candidate_runs, front_end, back_start);
-            (result, candidate_runs)
         }
     }
-}
 
-fn update_runs_after_truncation(
-    result: &str,
-    affix: &str,
-    runs: &mut Vec<TextRun>,
-    direction: TruncateFrom,
-) {
-    let mut retained = result.len().saturating_sub(affix.len());
-    match direction {
-        TruncateFrom::Start => {
-            for run_index in (0..runs.len()).rev() {
-                if runs[run_index].len <= retained {
-                    retained -= runs[run_index].len;
-                } else {
-                    runs[run_index].len = retained + affix.len();
-                    runs.drain(..run_index);
-                    break;
-                }
-            }
-        }
-        TruncateFrom::End => {
-            for run_index in 0..runs.len() {
-                if runs[run_index].len <= retained {
-                    retained -= runs[run_index].len;
-                } else {
-                    runs[run_index].len = retained + affix.len();
-                    runs.truncate(run_index + 1);
-                    break;
-                }
-            }
-        }
-        TruncateFrom::Middle => unreachable!(),
-    }
-}
+    display_runs.sort_by_key(|(start, _run)| *start);
+    candidate.runs = display_runs.into_iter().map(|(_start, run)| run).collect();
 
-fn update_runs_after_middle_truncation(
-    affix: &str,
-    runs: &mut Vec<TextRun>,
-    front_end: usize,
-    back_start: usize,
-) {
-    let original = mem::take(runs);
-    let mut result = Vec::with_capacity(original.len());
-    let mut byte_offset = 0usize;
-    for run in &original {
-        let run_end = byte_offset + run.len;
-        if byte_offset < front_end {
-            let mut retained = run.clone();
-            retained.len = run_end.min(front_end) - byte_offset;
-            result.push(retained);
-        }
-        byte_offset = run_end;
-    }
-    if let Some(last) = result.last_mut() {
-        last.len += affix.len();
-    } else if let Some(first) = original.first() {
-        let mut affix_run = first.clone();
-        affix_run.len = affix.len();
-        result.push(affix_run);
-    }
-    byte_offset = 0;
-    for run in &original {
-        let run_end = byte_offset + run.len;
-        if run_end > back_start {
-            let mut retained = run.clone();
-            retained.len = run_end - back_start.max(byte_offset);
-            result.push(retained);
-        }
-        byte_offset = run_end;
-    }
-    *runs = result;
+    candidate
 }
 
 #[cfg(test)]
@@ -1339,7 +1574,7 @@ mod truncation_tests {
     #[test]
     fn truncation_candidates_keep_complete_graphemes_and_cover_output_with_runs() {
         const FAMILY: &str = "👩‍👩‍👧‍👦";
-        let text = format!("Ae\u{301}{FAMILY}Z");
+        let text = format!("Ae\u{301}{FAMILY}🦀");
         let split = "Ae\u{301}".len();
         let runs = [
             TextRun {
@@ -1351,25 +1586,99 @@ mod truncation_tests {
                 ..Default::default()
             },
         ];
-        let mut boundaries = text
+        let boundaries = text
             .grapheme_indices(true)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        boundaries.push(text.len());
+            .map(|(index, _grapheme)| index)
+            .chain(std::iter::once(text.len()));
+        let grapheme_count = boundaries.clone().count().saturating_sub(1);
+        let boundaries = TruncationBoundaries::new(boundaries, grapheme_count);
 
         for (direction, keep, expected) in [
-            (TruncateFrom::Start, 2, format!("…{FAMILY}Z")),
+            (TruncateFrom::Start, 0, "…".to_owned()),
+            (TruncateFrom::End, 0, "…".to_owned()),
+            (TruncateFrom::Middle, 0, "…".to_owned()),
+            (TruncateFrom::Start, 1, "…🦀".to_owned()),
+            (TruncateFrom::Middle, 1, "A…".to_owned()),
+            (TruncateFrom::Start, 2, format!("…{FAMILY}🦀")),
             (TruncateFrom::End, 2, "Ae\u{301}…".to_owned()),
-            (TruncateFrom::Middle, 3, "Ae\u{301}…Z".to_owned()),
+            (TruncateFrom::Middle, 3, "Ae\u{301}…🦀".to_owned()),
+            (TruncateFrom::Start, usize::MAX, format!("…{text}")),
+            (TruncateFrom::End, usize::MAX, format!("{text}…")),
+            (
+                TruncateFrom::Middle,
+                usize::MAX,
+                format!("Ae\u{301}{FAMILY}…🦀"),
+            ),
         ] {
-            let (candidate, candidate_runs) =
+            let candidate =
                 make_truncation_candidate(&text, &boundaries, keep, "…", &runs, direction);
-            assert_eq!(candidate.as_ref(), expected, "{direction:?}");
+            assert_eq!(candidate.text.as_ref(), expected, "{direction:?}");
             assert_eq!(
-                candidate_runs.iter().map(|run| run.len).sum::<usize>(),
-                candidate.len(),
-                "style runs must cover {candidate:?} after {direction:?} truncation"
+                candidate.runs.iter().map(|run| run.len).sum::<usize>(),
+                candidate.text.len(),
+                "style runs must cover {:?} after {direction:?} truncation",
+                candidate.text
             );
+        }
+    }
+
+    #[test]
+    fn measured_truncation_keeps_the_selected_output_and_marker_fallback() {
+        let text = "Ae\u{301}👩‍👩‍👧‍👦🦀";
+
+        for (text, direction, expected) in [
+            ("", TruncateFrom::Start, "…"),
+            ("", TruncateFrom::End, "…"),
+            ("", TruncateFrom::Middle, "…"),
+            ("🦀", TruncateFrom::Start, "…"),
+            ("🦀", TruncateFrom::End, "…"),
+            ("🦀", TruncateFrom::Middle, "…"),
+            (text, TruncateFrom::Start, "…🦀"),
+            (text, TruncateFrom::End, "A…"),
+            (text, TruncateFrom::Middle, "A…"),
+        ] {
+            let runs = [TextRun {
+                len: text.len(),
+                ..Default::default()
+            }];
+            let boundaries = text
+                .grapheme_indices(true)
+                .map(|(index, _grapheme)| index)
+                .chain(std::iter::once(text.len()));
+
+            for initial_keep in [None, Some(0), Some(usize::MAX)] {
+                let (candidate, measured_text) = truncate_with_measured_candidates(
+                    text,
+                    boundaries.clone(),
+                    initial_keep,
+                    "…",
+                    &runs,
+                    direction,
+                    |candidate| {
+                        let fits = candidate.text.graphemes(true).count() <= 2;
+
+                        (candidate.text.clone(), fits)
+                    },
+                );
+                assert_eq!(
+                    candidate.text.as_ref(),
+                    expected,
+                    "{text:?} {direction:?} {initial_keep:?}"
+                );
+                assert_eq!(measured_text, candidate.text);
+            }
+
+            let (candidate, measured_text) = truncate_with_measured_candidates(
+                text,
+                boundaries,
+                None,
+                "…",
+                &runs,
+                direction,
+                |candidate| (candidate.text.clone(), false),
+            );
+            assert_eq!(candidate.text.as_ref(), "…");
+            assert_eq!(measured_text, candidate.text);
         }
     }
 }
@@ -1734,9 +2043,9 @@ mod tests {
 
                     assert_eq!(document.text, text);
                     assert_eq!(state.len, text.len());
-                    assert_eq!(state.size, Some(bounds.size));
-                    assert_eq!(state.size, Some(document.size(state.line_height)));
-                    assert_eq!(state.wrap_width, Some(px(width)));
+                    assert_eq!(state.size, bounds.size);
+                    assert_eq!(state.size, document.size(state.line_height));
+                    assert_eq!(state.options.wrap_width, Some(px(width)));
                     assert_eq!(state.truncate_width, None);
                     assert_eq!(state.bounds, if cached { previous_bounds } else { None });
 

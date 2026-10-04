@@ -1,12 +1,15 @@
 #[cfg(test)]
-use crate::{AtlasKey, AtlasTextureKind, TestTextSystem, hsla, point, size};
+use crate::{
+    AtlasKey, AtlasTextureKind, PlatformAtlas, TestAtlas, TestTextSystem, hsla, point, size,
+};
 
 #[cfg(test)]
 use std::{sync::atomic::AtomicUsize, sync::atomic::Ordering};
 
 use crate::{
-    Bounds, DevicePixels, Pixels, PlatformTextSystem, Point, Result, SharedString, Size,
-    StrikethroughStyle, TextAlign, TextRenderingMode, UnderlineStyle, px,
+    Bounds, DevicePixels, Pixels, PlatformTextSystem, Point, ResolvedDirection, Result,
+    SharedString, Size, StrikethroughStyle, TextAlign, TextRenderingMode, UnderlineStyle,
+    UnicodeBidi, px,
 };
 use anyhow::{Context as _, anyhow};
 use collections::FxHashMap;
@@ -63,7 +66,6 @@ pub struct TextSystem {
     platform_text_system: Arc<dyn PlatformTextSystem>,
     font_ids_by_font: RwLock<FxHashMap<Font, Result<FontId>>>,
     font_metrics: RwLock<FxHashMap<FontId, FontMetrics>>,
-    raster_metadata: RwLock<FxHashMap<RenderGlyphParams, RasterizedGlyphMetadata>>,
 }
 
 impl TextSystem {
@@ -72,7 +74,6 @@ impl TextSystem {
         TextSystem {
             platform_text_system,
             font_metrics: RwLock::default(),
-            raster_metadata: RwLock::default(),
             font_ids_by_font: RwLock::default(),
         }
     }
@@ -235,43 +236,29 @@ impl TextSystem {
         }
     }
 
-    /// Rasterizes a glyph and records only the metadata needed on later atlas hits.
-    pub fn rasterize_glyph(&self, params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
+    /// Rasterizes a glyph and validates its placement and pixel buffer.
+    pub fn rasterize_glyph(&self, params: &RenderGlyphParams) -> Result<ValidatedRasterizedGlyph> {
         let glyph = self.platform_text_system.rasterize_glyph(params)?;
-        glyph.validate()?;
 
-        let metadata = glyph.metadata();
-        let cached = self.raster_metadata.upgradable_read();
-        if let Some(previous) = cached.get(params) {
-            anyhow::ensure!(
-                *previous == metadata,
-                "glyph raster metadata changed for the same render parameters"
-            );
-        } else {
-            let mut cached = RwLockUpgradableReadGuard::upgrade(cached);
-            cached.insert(params.clone(), metadata);
-        }
-        Ok(glyph)
-    }
-
-    pub(crate) fn raster_metadata(
-        &self,
-        params: &RenderGlyphParams,
-    ) -> Option<RasterizedGlyphMetadata> {
-        self.raster_metadata.read().get(params).copied()
+        ValidatedRasterizedGlyph::new(glyph)
     }
 
     /// Normalizes a requested scene color and render mode into the settings which affect the
     /// cached glyph raster.
     pub(crate) fn prepare_raster_style(
         &self,
+        font_id: FontId,
+        glyph_id: GlyphId,
         scene_color: Hsla,
         requested_mode: GlyphRenderMode,
     ) -> PreparedRasterStyle {
         self.platform_text_system
             .prepare_raster_style(RasterStyleRequest {
+                font_id,
+                glyph_id,
                 scene_color: crate::hsla_to_rgba(scene_color),
                 requested_mode,
+                foreground_dependency: ForegroundDependency::Full,
             })
     }
 
@@ -354,18 +341,39 @@ impl WindowTextSystem {
         runs: &[TextRun],
         wrap_width: Option<Pixels>,
         line_clamp: Option<usize>,
-    ) -> Result<WrappedLine> {
+    ) -> Result<ShapedText> {
+        self.shape_text_with_options(
+            text,
+            font_size,
+            runs,
+            TextLayoutOptions {
+                wrap_width,
+                line_clamp,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// Shapes a complete text document with explicit direction and alignment options.
+    #[doc(hidden)]
+    pub fn shape_text_with_options<S: AsRef<str> + Into<SharedString>>(
+        &self,
+        text: S,
+        font_size: Pixels,
+        runs: &[TextRun],
+        options: TextLayoutOptions,
+    ) -> Result<ShapedText> {
         let text = text.into();
         let layout = self
             .line_layout_cache
-            .layout_wrapped_line(&text, font_size, runs, wrap_width, line_clamp);
+            .layout_text_with_options(&text, font_size, runs, options);
 
-        Ok(WrappedLine { layout, text })
+        Ok(ShapedText { layout, text })
     }
 
     /// Layout text and atomic element boxes in one inline formatting context.
-    pub fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
-        self.text_system.platform_text_system.layout_inline(request)
+    pub fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> Arc<InlineLayout> {
+        self.line_layout_cache.layout_inline(request)
     }
 
     /// Layout the given line of text, at the given font_size.
@@ -503,6 +511,58 @@ pub struct TextRun {
     pub letter_spacing: Option<Pixels>,
 }
 
+/// The paragraph base-direction policy supplied to a text backend.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ParagraphDirection {
+    /// Determine paragraph direction from its source text.
+    #[default]
+    Auto,
+    /// Use an explicit left-to-right paragraph base direction.
+    LeftToRight,
+    /// Use an explicit right-to-left paragraph base direction.
+    RightToLeft,
+}
+
+impl From<ResolvedDirection> for ParagraphDirection {
+    fn from(direction: ResolvedDirection) -> Self {
+        match direction {
+            ResolvedDirection::LeftToRight => Self::LeftToRight,
+            ResolvedDirection::RightToLeft => Self::RightToLeft,
+        }
+    }
+}
+
+/// A directional scope within an inline text document.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct InlineBidiScope {
+    /// UTF-8 source range covered by this scope.
+    pub range: Range<usize>,
+    /// Resolved direction used by the scope.
+    pub direction: ResolvedDirection,
+    /// The CSS `unicode-bidi` behavior for the scope.
+    pub unicode_bidi: UnicodeBidi,
+}
+
+/// Direction, wrapping, and alignment options for a complete text document.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct TextLayoutOptions {
+    /// Optional soft-wrap width.
+    pub wrap_width: Option<Pixels>,
+    /// Optional maximum number of visual rows.
+    pub line_clamp: Option<usize>,
+    /// Width used for horizontal alignment, independently of wrapping.
+    pub alignment_width: Option<Pixels>,
+    /// Horizontal text alignment.
+    pub text_align: TextAlign,
+    /// Paragraph base-direction policy.
+    pub direction: ParagraphDirection,
+    /// Bidirectional behavior applied to the complete document.
+    pub unicode_bidi: UnicodeBidi,
+}
+
 /// Complete input for one backend-owned text document layout.
 #[derive(Clone, Copy, Debug)]
 pub struct TextLayoutRequest<'a> {
@@ -512,14 +572,12 @@ pub struct TextLayoutRequest<'a> {
     pub font_size: Pixels,
     /// Complete shaping and paint styles covering `text`.
     pub runs: &'a [TextRun],
-    /// Optional soft-wrap width.
-    pub wrap_width: Option<Pixels>,
-    /// Optional maximum number of visual rows.
-    pub line_clamp: Option<usize>,
+    /// Wrapping, alignment, and bidirectional layout options.
+    pub options: TextLayoutOptions,
 }
 
 /// An atomic element inserted at a UTF-8 boundary in an inline document.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InlineBoxRequest {
     /// Identifier returned with the positioned box.
     pub id: u64,
@@ -532,7 +590,7 @@ pub struct InlineBoxRequest {
 }
 
 /// Resolved font size and line height for part of an inline document.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct InlineTextStyle {
     /// UTF-8 range receiving these resolved metrics.
     pub range: Range<usize>,
@@ -543,7 +601,7 @@ pub struct InlineTextStyle {
 }
 
 /// Complete input for a document containing text and element boxes.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct InlineLayoutRequest<'a> {
     /// UTF-8 source text.
     pub text: &'a str,
@@ -559,12 +617,10 @@ pub struct InlineLayoutRequest<'a> {
     pub line_height: Pixels,
     /// Metrics for the inline container's base font.
     pub text_metrics: InlineTextMetrics,
-    /// Optional soft-wrap width.
-    pub wrap_width: Option<Pixels>,
-    /// Optional maximum number of visual rows.
-    pub line_clamp: Option<usize>,
-    /// Horizontal alignment within `wrap_width`.
-    pub text_align: TextAlign,
+    /// Wrapping, alignment, and bidirectional layout options.
+    pub options: TextLayoutOptions,
+    /// Directional scopes established by nested inline elements.
+    pub bidi_scopes: &'a [InlineBidiScope],
 }
 
 impl Eq for TextRun {}
@@ -634,11 +690,11 @@ impl From<&TextRun> for PaintStyle {
 #[repr(C)]
 pub struct GlyphId(pub u32);
 
-/// Parameters for rendering a glyph, used as cache keys for raster bounds.
+/// Parameters for rendering a glyph, used as cache keys for glyph atlas entries.
 ///
 /// This struct identifies a specific glyph rendering configuration including
 /// font, size, subpixel positioning, and scale factor. It's used to look up
-/// cached raster bounds and sprite atlas entries.
+/// cached pixels, placement metadata, and sprite atlas entries.
 #[derive(Clone, Debug, PartialEq)]
 #[expect(missing_docs)]
 pub struct RenderGlyphParams {
@@ -699,10 +755,37 @@ impl RasterColorExt for crate::Rgba {
 /// A scene request before a platform rasterizer normalizes its cache-relevant settings.
 #[derive(Clone, Copy, Debug)]
 pub struct RasterStyleRequest {
+    /// The canonical font instance containing the glyph.
+    pub font_id: FontId,
+    /// The glyph whose artwork will be rasterized.
+    pub glyph_id: GlyphId,
     /// The exact application color. Rasterizers may only retain a normalized derivative of it.
     pub scene_color: crate::Rgba,
     /// The requested kind of glyph image.
     pub requested_mode: GlyphRenderMode,
+    /// Which foreground channels can alter the selected artwork.
+    pub foreground_dependency: ForegroundDependency,
+}
+
+impl RasterStyleRequest {
+    /// Quantizes the foreground after removing channels unused by the artwork.
+    pub fn normalized_color(self) -> Rgba8 {
+        let color = self.scene_color.quantize_raster_color();
+        if self.foreground_dependency == ForegroundDependency::AlphaOnly {
+            return Rgba8::new(0, 0, 0, color.alpha);
+        }
+
+        color
+    }
+}
+
+/// Describes which foreground channels can change rasterized color artwork.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ForegroundDependency {
+    /// The artwork or its fallback may use the complete foreground color.
+    Full,
+    /// Fixed RGB artwork uses only the foreground alpha.
+    AlphaOnly,
 }
 
 /// The cache-relevant raster settings chosen by a platform rasterizer.
@@ -712,6 +795,8 @@ pub struct PreparedRasterStyle {
     pub mode: GlyphRenderMode,
     /// Any normalized color effect baked into coverage or color pixels.
     pub color_effect: RasterColorEffect,
+    /// Which foreground channels can alter this raster or its fallback.
+    pub foreground_dependency: ForegroundDependency,
 }
 
 impl PreparedRasterStyle {
@@ -720,6 +805,16 @@ impl PreparedRasterStyle {
         Self {
             mode,
             color_effect: RasterColorEffect::Independent,
+            foreground_dependency: ForegroundDependency::Full,
+        }
+    }
+
+    /// Creates a native preblended style from the request's relevant color channels.
+    pub fn preblend(request: RasterStyleRequest) -> Self {
+        Self {
+            mode: request.requested_mode,
+            color_effect: RasterColorEffect::Preblend(request.normalized_color()),
+            foreground_dependency: request.foreground_dependency,
         }
     }
 }
@@ -758,7 +853,7 @@ pub enum RasterizedGlyphFormat {
     BgraColor,
 }
 
-/// A glyph raster ready for insertion into a renderer atlas.
+/// A glyph raster produced by a platform rasterizer.
 #[derive(Clone, Debug)]
 pub struct RasterizedGlyph {
     /// Placement relative to the glyph's baseline origin.
@@ -769,12 +864,6 @@ pub struct RasterizedGlyph {
     pub format: RasterizedGlyphFormat,
     /// Pixel bytes. Color pixels use straight alpha.
     pub pixels: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RasterizedGlyphMetadata {
-    pub(crate) bounds: Bounds<DevicePixels>,
-    pub(crate) format: RasterizedGlyphFormat,
 }
 
 impl RasterizedGlyph {
@@ -788,13 +877,6 @@ impl RasterizedGlyph {
         }
     }
 
-    pub(crate) fn metadata(&self) -> RasterizedGlyphMetadata {
-        RasterizedGlyphMetadata {
-            bounds: self.bounds,
-            format: self.format,
-        }
-    }
-
     /// Checks the buffer dimensions and byte count promised by `format`.
     pub fn validate(&self) -> Result<()> {
         anyhow::ensure!(
@@ -803,18 +885,21 @@ impl RasterizedGlyph {
             self.bounds.size,
             self.size
         );
+
         let width: usize = self
             .size
             .width
             .0
             .try_into()
             .map_err(|_| anyhow::anyhow!("glyph raster width is negative"))?;
+
         let height: usize = self
             .size
             .height
             .0
             .try_into()
             .map_err(|_| anyhow::anyhow!("glyph raster height is negative"))?;
+
         if width == 0 || height == 0 {
             anyhow::ensure!(
                 width == 0 && height == 0 && self.pixels.is_empty(),
@@ -822,6 +907,7 @@ impl RasterizedGlyph {
             );
             return Ok(());
         }
+
         let bytes_per_pixel = match self.format {
             RasterizedGlyphFormat::AlphaMask => 1,
             RasterizedGlyphFormat::BgraSubpixelMask | RasterizedGlyphFormat::BgraColor => 4,
@@ -830,6 +916,7 @@ impl RasterizedGlyph {
             .checked_mul(height)
             .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
             .ok_or_else(|| anyhow::anyhow!("glyph raster byte count overflow"))?;
+
         anyhow::ensure!(
             self.pixels.len() == expected_len,
             "glyph raster format {:?} requires {expected_len} bytes for {}x{}, got {}",
@@ -838,8 +925,33 @@ impl RasterizedGlyph {
             height,
             self.pixels.len()
         );
+
         Ok(())
     }
+}
+
+/// A glyph raster whose placement and pixel buffer have passed validation.
+#[derive(Clone, Debug, Deref)]
+pub struct ValidatedRasterizedGlyph(RasterizedGlyph);
+
+impl ValidatedRasterizedGlyph {
+    /// Validates a glyph raster before it can be used by an atlas builder.
+    pub fn new(glyph: RasterizedGlyph) -> Result<Self> {
+        glyph.validate()?;
+
+        Ok(Self(glyph))
+    }
+}
+
+/// A cached glyph's GPU tile and the placement metadata for its uploaded pixels.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlyphAtlasEntry {
+    /// The GPU tile, or `None` for a successfully empty glyph.
+    pub tile: Option<crate::AtlasTile>,
+    /// Placement relative to the glyph's baseline origin.
+    pub bounds: Bounds<DevicePixels>,
+    /// Byte layout of the cached pixels.
+    pub format: RasterizedGlyphFormat,
 }
 
 impl Eq for RenderGlyphParams {}
@@ -1010,6 +1122,101 @@ mod text_range_tests {
 }
 
 #[cfg(test)]
+mod layout_cache_tests {
+    use super::*;
+
+    fn window_text_system() -> WindowTextSystem {
+        WindowTextSystem::new(Arc::new(TextSystem::new(Arc::new(TestTextSystem))))
+    }
+
+    #[test]
+    fn paint_changes_reuse_shaped_geometry() {
+        let system = window_text_system();
+        let text = SharedString::from("paint cache");
+        let mut run = TextRun {
+            len: text.len(),
+            color: hsla(0.0, 0.8, 0.4, 1.0),
+            ..Default::default()
+        };
+        let first = system
+            .shape_text(text.clone(), px(16.0), &[run.clone()], None, None)
+            .unwrap();
+
+        run.color = hsla(0.6, 0.8, 0.4, 1.0);
+        run.underline = Some(crate::UnderlineStyle {
+            thickness: px(1.5),
+            color: None,
+            wavy: false,
+        });
+        let second = system
+            .shape_text(text, px(16.0), std::slice::from_ref(&run), None, None)
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first.platform_layout, &second.platform_layout));
+        assert_eq!(second.paint_fragments[0].style, PaintStyle::from(&run));
+        assert!(second.paint_fragments[0].underline_offset.is_some());
+    }
+
+    #[test]
+    fn inline_layouts_reuse_all_valid_widths_across_frames() {
+        let system = window_text_system();
+        let text = "cached inline paragraph";
+        let runs = [TextRun {
+            len: text.len(),
+            ..Default::default()
+        }];
+        let request = |wrap_width| InlineLayoutRequest {
+            text,
+            runs: &runs,
+            text_styles: &[],
+            boxes: &[],
+            font_size: px(16.0),
+            line_height: px(20.0),
+            text_metrics: InlineTextMetrics::default(),
+            options: TextLayoutOptions {
+                wrap_width: Some(wrap_width),
+                text_align: TextAlign::Left,
+                ..Default::default()
+            },
+            bidi_scopes: &[],
+        };
+
+        let wide = system.layout_inline(request(px(200.0)));
+        let narrow = system.layout_inline(request(px(80.0)));
+        assert!(!Arc::ptr_eq(&wide, &narrow));
+
+        let painted_runs = [TextRun {
+            color: hsla(0.5, 0.8, 0.4, 1.0),
+            ..runs[0].clone()
+        }];
+        let changed_paint = system.layout_inline(InlineLayoutRequest {
+            runs: &painted_runs,
+            ..request(px(200.0))
+        });
+        let changed_size = system.layout_inline(InlineLayoutRequest {
+            font_size: px(18.0),
+            ..request(px(200.0))
+        });
+        assert!(!Arc::ptr_eq(&wide, &changed_paint));
+        assert!(!Arc::ptr_eq(&wide, &changed_size));
+        assert!(Arc::ptr_eq(
+            &wide,
+            &system.layout_inline(request(px(200.0)))
+        ));
+
+        system.finish_frame();
+        assert!(Arc::ptr_eq(
+            &wide,
+            &system.layout_inline(request(px(200.0)))
+        ));
+        assert!(Arc::ptr_eq(
+            &narrow,
+            &system.layout_inline(request(px(80.0)))
+        ));
+    }
+}
+
+#[cfg(test)]
 mod raster_contract_tests {
     use super::*;
 
@@ -1147,12 +1354,24 @@ mod raster_contract_tests {
     fn prepared_style_and_format_drive_atlas_keys_without_caching_pixels() {
         let backend = Arc::new(SequencedRasterizer::default());
         let text_system = TextSystem::new(backend.clone());
-        let style_a =
-            text_system.prepare_raster_style(hsla(0.0, 0.0, 0.20, 1.0), GlyphRenderMode::Grayscale);
-        let style_b =
-            text_system.prepare_raster_style(hsla(0.0, 0.0, 0.24, 1.0), GlyphRenderMode::Grayscale);
-        let style_c =
-            text_system.prepare_raster_style(hsla(0.0, 0.0, 0.30, 1.0), GlyphRenderMode::Grayscale);
+        let style_a = text_system.prepare_raster_style(
+            FontId(7),
+            GlyphId(42),
+            hsla(0.0, 0.0, 0.20, 1.0),
+            GlyphRenderMode::Grayscale,
+        );
+        let style_b = text_system.prepare_raster_style(
+            FontId(7),
+            GlyphId(42),
+            hsla(0.0, 0.0, 0.24, 1.0),
+            GlyphRenderMode::Grayscale,
+        );
+        let style_c = text_system.prepare_raster_style(
+            FontId(7),
+            GlyphId(42),
+            hsla(0.0, 0.0, 0.30, 1.0),
+            GlyphRenderMode::Grayscale,
+        );
         assert_eq!(style_a, style_b, "nearby scene colors share a mask style");
         assert_ne!(
             style_a, style_c,
@@ -1169,15 +1388,6 @@ mod raster_contract_tests {
         assert_eq!(first_raster.pixels, reused_raster.pixels);
         assert_eq!(first_raster.pixels, distinct_raster.pixels);
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            text_system.raster_metadata(&first),
-            Some(first_raster.metadata())
-        );
-        assert_eq!(
-            text_system.raster_metadata(&third),
-            Some(distinct_raster.metadata())
-        );
-
         for (format, expected) in [
             (
                 RasterizedGlyphFormat::AlphaMask,
@@ -1200,28 +1410,212 @@ mod raster_contract_tests {
     }
 
     #[test]
-    fn only_successful_valid_native_rasters_record_metadata() {
+    fn atlas_entries_own_their_raster_metadata_and_retry_failures() {
         let backend = Arc::new(SequencedRasterizer {
             attempts: AtomicUsize::new(0),
             fail_until_valid: true,
         });
         let text_system = TextSystem::new(backend.clone());
         let params = params(PreparedRasterStyle::independent(GlyphRenderMode::Grayscale));
+        let atlas = TestAtlas::new();
 
-        assert!(text_system.rasterize_glyph(&params).is_err());
-        assert!(text_system.raster_metadata(&params).is_none());
-        assert!(text_system.rasterize_glyph(&params).is_err());
-        assert!(text_system.raster_metadata(&params).is_none());
-        let first_success = text_system.rasterize_glyph(&params).unwrap();
-        let second_success = text_system.rasterize_glyph(&params).unwrap();
-
-        assert_eq!(first_success.pixels, [0x7f]);
-        assert_eq!(second_success.pixels, [0x7f]);
-        assert_eq!(
-            text_system.raster_metadata(&params),
-            Some(first_success.metadata())
+        assert!(
+            atlas
+                .get_or_insert_glyph_with(&params, &mut || { text_system.rasterize_glyph(&params) })
+                .is_err()
         );
+        assert!(
+            atlas
+                .get_or_insert_glyph_with(&params, &mut || { text_system.rasterize_glyph(&params) })
+                .is_err()
+        );
+        let first_success = atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+        let second_success = atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+
+        assert_eq!(first_success, second_success);
+        assert_eq!(
+            first_success.bounds.size,
+            size(DevicePixels(1), DevicePixels(1))
+        );
+        assert_eq!(first_success.format, RasterizedGlyphFormat::AlphaMask);
+        assert!(first_success.tile.is_some());
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+
+        atlas.clear();
+        atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
         assert_eq!(backend.attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn separate_atlases_keep_the_metadata_for_their_own_pixels() {
+        let backend = Arc::new(ChangingRasterizer::default());
+        let text_system = TextSystem::new(backend.clone());
+        let params = params(PreparedRasterStyle::independent(GlyphRenderMode::Color));
+        let first_atlas = TestAtlas::new();
+        let second_atlas = TestAtlas::new();
+
+        let silhouette = first_atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+        let silhouette_hit = first_atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+        assert_eq!(silhouette_hit, silhouette);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 1);
+
+        let color = second_atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+        assert_ne!(color.bounds, silhouette.bounds);
+        assert_ne!(color.format, silhouette.format);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+
+        let original = first_atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+        assert_eq!(original, silhouette);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 2);
+
+        first_atlas.clear();
+        let recovered = first_atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))
+            .unwrap();
+        assert_ne!(recovered.bounds, silhouette.bounds);
+        assert_eq!(recovered.format, RasterizedGlyphFormat::BgraColor);
+        assert_eq!(backend.attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn successful_empty_glyphs_are_cached_without_a_tile() {
+        let atlas = TestAtlas::new();
+        let params = params(PreparedRasterStyle::independent(GlyphRenderMode::Grayscale));
+        let mut builds = 0;
+        let mut build = || {
+            builds += 1;
+
+            ValidatedRasterizedGlyph::new(RasterizedGlyph::empty(RasterizedGlyphFormat::AlphaMask))
+        };
+
+        let first = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
+        let second = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
+        assert_eq!(first, second);
+        assert!(first.tile.is_none());
+        assert_eq!(builds, 1);
+    }
+
+    #[test]
+    fn custom_glyph_builders_validate_before_caching() {
+        let atlas = TestAtlas::new();
+        let params = params(PreparedRasterStyle::independent(GlyphRenderMode::Grayscale));
+        let mut builds = 0;
+        let mut build = || {
+            builds += 1;
+            let size = size(DevicePixels(1), DevicePixels(1));
+            let pixels = if builds == 1 { Vec::new() } else { vec![255] };
+
+            ValidatedRasterizedGlyph::new(RasterizedGlyph {
+                bounds: Bounds {
+                    origin: Point::default(),
+                    size,
+                },
+                size,
+                format: RasterizedGlyphFormat::AlphaMask,
+                pixels,
+            })
+        };
+
+        assert!(atlas.get_or_insert_glyph_with(&params, &mut build).is_err());
+
+        let first = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
+        let second = atlas.get_or_insert_glyph_with(&params, &mut build).unwrap();
+        assert_eq!(first, second);
+        assert!(first.tile.is_some());
+        assert_eq!(builds, 2);
+    }
+
+    #[derive(Default)]
+    struct ChangingRasterizer {
+        attempts: AtomicUsize,
+    }
+
+    impl PlatformTextSystem for ChangingRasterizer {
+        fn add_fonts(&self, _fonts: Vec<Cow<'static, [u8]>>) -> Result<()> {
+            Ok(())
+        }
+
+        fn all_font_names(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn font_id(&self, descriptor: &Font) -> Result<FontId> {
+            PlatformTextSystem::font_id(&TestTextSystem, descriptor)
+        }
+
+        fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+            PlatformTextSystem::font_metrics(&TestTextSystem, font_id)
+        }
+
+        fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>> {
+            PlatformTextSystem::typographic_bounds(&TestTextSystem, font_id, glyph_id)
+        }
+
+        fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>> {
+            PlatformTextSystem::advance(&TestTextSystem, font_id, glyph_id)
+        }
+
+        fn glyph_for_char(&self, font_id: FontId, character: char) -> Option<GlyphId> {
+            PlatformTextSystem::glyph_for_char(&TestTextSystem, font_id, character)
+        }
+
+        fn rasterize_glyph(&self, _params: &RenderGlyphParams) -> Result<RasterizedGlyph> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            let (origin, size, format) = match attempt {
+                0 => (
+                    point(DevicePixels(-2), DevicePixels(-7)),
+                    size(DevicePixels(2), DevicePixels(3)),
+                    RasterizedGlyphFormat::AlphaMask,
+                ),
+                1 => (
+                    point(DevicePixels(1), DevicePixels(-9)),
+                    size(DevicePixels(4), DevicePixels(5)),
+                    RasterizedGlyphFormat::BgraColor,
+                ),
+                _ => (
+                    point(DevicePixels(3), DevicePixels(-8)),
+                    size(DevicePixels(3), DevicePixels(4)),
+                    RasterizedGlyphFormat::BgraColor,
+                ),
+            };
+            let bytes_per_pixel = if format == RasterizedGlyphFormat::AlphaMask {
+                1
+            } else {
+                4
+            };
+
+            Ok(RasterizedGlyph {
+                bounds: Bounds { origin, size },
+                size,
+                format,
+                pixels: vec![
+                    0x7f;
+                    size.width.0 as usize * size.height.0 as usize * bytes_per_pixel
+                ],
+            })
+        }
+
+        fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
+            PlatformTextSystem::layout_text(&TestTextSystem, request)
+        }
+
+        fn layout_inline(&self, request: InlineLayoutRequest<'_>) -> InlineLayout {
+            PlatformTextSystem::layout_inline(&TestTextSystem, request)
+        }
     }
 
     #[derive(Default)]
@@ -1301,6 +1695,7 @@ mod raster_contract_tests {
                 color_effect: RasterColorEffect::Dilation(
                     (request.scene_color.red * 4.0).floor() as u8
                 ),
+                foreground_dependency: request.foreground_dependency,
             }
         }
 

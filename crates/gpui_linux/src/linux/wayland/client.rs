@@ -434,6 +434,8 @@ pub(crate) enum PendingActivation {
     Path(PathBuf),
     /// A window from ourselves to raise.
     Window(ObjectId),
+    /// A desktop character picker to launch.
+    CharacterPalette,
 }
 
 impl WaylandClientState {
@@ -546,6 +548,25 @@ impl WaylandClientStatePtr {
     pub fn set_pending_activation(&self, window: ObjectId) {
         self.0.upgrade().unwrap().borrow_mut().pending_activation =
             Some(PendingActivation::Window(window));
+    }
+
+    pub fn show_character_palette(&self, surface: &wl_surface::WlSurface) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if let Some(activation) = state.globals.activation.clone() {
+            state.pending_activation = Some(PendingActivation::CharacterPalette);
+            let token = activation.get_activation_token(&state.globals.qh, ());
+            if let Some(serial) = state.serial_tracker.selection_serial() {
+                token.set_serial(serial.as_raw(), &state.wl_seat);
+            }
+            token.set_surface(surface);
+            token.commit();
+        } else {
+            crate::linux::character_palette::show_character_palette(
+                state.common.background_executor.clone(),
+                None,
+            );
+        }
     }
 
     pub fn enable_ime(&self) {
@@ -1678,6 +1699,9 @@ impl Dispatch<xdg_activation_token_v1::XdgActivationTokenV1, ()> for WaylandClie
                 Some(PendingActivation::Uri(uri)) => open_uri_internal(executor, &uri, Some(token)),
                 Some(PendingActivation::Path(path)) => {
                     reveal_path_internal(executor, path, Some(token))
+                }
+                Some(PendingActivation::CharacterPalette) => {
+                    crate::linux::character_palette::show_character_palette(executor, Some(token))
                 }
                 Some(PendingActivation::Window(window)) => {
                     let Some(window) = get_window(&mut state, &window) else {

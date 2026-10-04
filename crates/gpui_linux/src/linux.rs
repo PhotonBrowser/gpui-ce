@@ -1,3 +1,5 @@
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod character_palette;
 mod dispatcher;
 mod headless;
 mod keyboard;

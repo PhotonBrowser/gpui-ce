@@ -44,17 +44,18 @@ use crate::util::FluentBuilder;
 use crate::{
     Action, AnyWindowHandle, App, AsyncWindowContext, BackgroundExecutor, Bounds,
     DEFAULT_WINDOW_SIZE, DevicePixels, DispatchEventResult, Edges, ExternalDragPayload, Font,
-    FontId, FontMetrics, ForegroundExecutor, GlyphId, GpuSpecs, ImageSource, InlineLayout,
-    InlineLayoutRequest, Keymap, LineLayout, Pixels, PlatformGestures, PlatformInput, Point,
-    PreparedRasterStyle, Priority, RasterStyleRequest, RasterizedGlyph, RasterizedGlyphFormat,
-    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Scene, SharedString, Size,
-    SvgRenderer, SystemWindowTab, Task, TextLayoutRequest, Window, WindowControlArea, hash, point,
-    px,
+    FontId, FontMetrics, ForegroundExecutor, GlyphAtlasEntry, GlyphId, GpuSpecs, ImageSource,
+    InlineLayout, InlineLayoutRequest, Keymap, LineLayout, Pixels, PlatformGestures, PlatformInput,
+    Point, PreparedRasterStyle, Priority, RasterStyleRequest, RasterizedGlyph,
+    RasterizedGlyphFormat, RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams,
+    Scene, SharedString, Size, SvgRenderer, SystemWindowTab, Task, TextLayoutRequest,
+    ValidatedRasterizedGlyph, Window, WindowControlArea, hash, point, px,
 };
 #[cfg(any(target_os = "linux", target_os = "freebsd"))]
 use anyhow::bail;
 use anyhow::{Context as _, Result};
 use async_task::Runnable;
+use collections::FxHashMap;
 use futures::channel::oneshot;
 #[cfg(any(test, feature = "test-support", feature = "bench-support"))]
 use image::RgbaImage;
@@ -954,7 +955,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
-    fn show_character_palette(&self) {}
+    /// Show the platform character palette.
+    ///
+    /// The default implementation logs a warning when the backend does not
+    /// support showing a character palette.
+    fn show_character_palette(&self) {
+        log::warn!("show_character_palette is not implemented by this platform backend");
+    }
     fn titlebar_double_click(&self, _is_resizable: bool, _is_minimizable: bool) {}
     fn on_move_tab_to_new_window(&self, _callback: Box<dyn FnMut()>) {}
     fn on_merge_all_windows(&self, _callback: Box<dyn FnMut()>) {}
@@ -1227,9 +1234,10 @@ mod tests {
         Bounds, CaretAffinity, CaretMovement, CaretPosition, Font, FontId, FontMetrics, GlyphId,
         InlineLayout, InlineLayoutRequest, InlineVisualLine, LineLayout, PaintFragment, PaintStyle,
         Pixels, PlatformTextLayout, PlatformTextSystem, Point, PositionedInlineBox,
-        RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams, ShapedGlyph, Size, TextBoundary,
-        TextDirection, TextLayoutRequest, TextMovement, TextRenderingMode, TextSelectionKind,
-        VisualDirection, VisualLine, align_inline_boxes, point, px, size,
+        RasterizedGlyph, RasterizedGlyphFormat, RenderGlyphParams, ResolvedDirection, ShapedGlyph,
+        Size, TextAlign, TextBoundary, TextDirection, TextLayoutRequest, TextMovement,
+        TextRenderingMode, TextSelectionKind, VisualDirection, VisualLine, align_inline_boxes,
+        point, px, size,
     };
     use anyhow::Result;
     use std::{borrow::Cow, ops::Range, sync::Arc};
@@ -1478,6 +1486,7 @@ mod tests {
             if !matches!(kind, TextSelectionKind::Word) {
                 return 0..self.len();
             }
+
             let index = self
                 .caret_from_pixel_point(pixel_point, line_height)
                 .unwrap_or_else(|caret| caret)
@@ -1500,6 +1509,15 @@ mod tests {
         #[allow(dead_code)]
         pub fn new() -> Self {
             Self
+        }
+
+        fn em_width(&self, font_size: Pixels) -> Pixels {
+            let metrics = self.font_metrics(FontId(0));
+            let advance = self
+                .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
+                .unwrap();
+
+            font_size * advance.width / metrics.units_per_em as f32
         }
     }
 
@@ -1538,7 +1556,12 @@ mod tests {
 
     fn add_test_inline_box_advances(layout: &mut LineLayout, request: InlineLayoutRequest<'_>) {
         for fragment in &mut layout.paint_fragments {
-            for (glyph, (index, _)) in fragment.glyphs.iter_mut().zip(request.text.char_indices()) {
+            // This layout owns its freshly built glyphs. If they become shared,
+            // make_mut copies the slice before changing their positions.
+            for (glyph, (index, _)) in Arc::make_mut(&mut fragment.glyphs)
+                .iter_mut()
+                .zip(request.text.char_indices())
+            {
                 glyph.position.x += request
                     .boxes
                     .iter()
@@ -1630,12 +1653,7 @@ mod tests {
             let shaping_runs = request.runs;
             let mut position = px(0.);
             let metrics = self.font_metrics(FontId(0));
-            let em_width = font_size
-                * self
-                    .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
-                    .unwrap()
-                    .width
-                / metrics.units_per_em as f32;
+            let em_width = self.em_width(font_size);
             let mut glyphs = Vec::new();
             let mut stops = vec![(0, Pixels::ZERO)];
 
@@ -1666,34 +1684,54 @@ mod tests {
                 tracking_covered = end;
             }
 
+            let direction = match request.options.direction {
+                crate::ParagraphDirection::LeftToRight => ResolvedDirection::LeftToRight,
+                crate::ParagraphDirection::RightToLeft => ResolvedDirection::RightToLeft,
+                crate::ParagraphDirection::Auto => {
+                    ResolvedDirection::from_first_strong(text).unwrap_or_default()
+                }
+            };
+            let advance = position + tracking;
+            let alignment_width = request.options.alignment_width.unwrap_or(advance);
+            let offset = match request.options.text_align {
+                TextAlign::Start if direction.is_rtl() => alignment_width - advance,
+                TextAlign::Start | TextAlign::Left => Pixels::ZERO,
+                TextAlign::Center => (alignment_width - advance) / 2.0,
+                TextAlign::End if direction.is_rtl() => Pixels::ZERO,
+                TextAlign::End | TextAlign::Right => alignment_width - advance,
+            };
+
+            for (_idx, position) in &mut stops {
+                *position += offset;
+            }
+
             let visual_lines = [VisualLine {
                 text_range: 0..text.len(),
-                fragment_range: 0..usize::from(!glyphs.is_empty()),
-                advance_width: position + tracking,
+                paint_fragment_range: 0..usize::from(!glyphs.is_empty()),
+                advance_width: advance,
+                offset,
+                direction,
             }]
             .into_iter()
             .collect();
             let paint_fragments = (!glyphs.is_empty())
                 .then(|| PaintFragment {
+                    source_run: 0,
                     font_id: FontId(0),
                     font_size,
-                    glyphs,
-                    x_range: Pixels::ZERO..position + tracking,
+                    glyphs: glyphs.into(),
+                    x_range: Pixels::ZERO..advance,
                     style: shaping_runs
                         .first()
                         .map_or_else(PaintStyle::default, PaintStyle::from),
-                    underline_offset: shaping_runs
-                        .first()
-                        .and_then(|run| run.underline.map(|_| font_size * 0.1)),
-                    strikethrough_offset: shaping_runs
-                        .first()
-                        .and_then(|run| run.strikethrough.map(|_| -font_size * 0.3)),
+                    underline_offset: Some(font_size * 0.1),
+                    strikethrough_offset: Some(-font_size * 0.3),
                 })
                 .into_iter()
                 .collect();
             LineLayout {
                 font_size,
-                width: position + tracking,
+                width: advance,
                 ascent: font_size * (metrics.ascent / metrics.units_per_em as f32),
                 descent: font_size * (metrics.descent / metrics.units_per_em as f32),
                 visual_lines,
@@ -1702,7 +1740,7 @@ mod tests {
                 platform_layout: Arc::new(TestPlatformTextLayout {
                     text: text.to_owned(),
                     stops,
-                    size: size(position + tracking, font_size),
+                    size: size(advance, font_size),
                 }),
             }
         }
@@ -1712,17 +1750,10 @@ mod tests {
                 text: request.text,
                 font_size: request.font_size,
                 runs: request.runs,
-                wrap_width: request.wrap_width,
-                line_clamp: request.line_clamp,
+                options: request.options,
             });
 
-            let metrics = self.font_metrics(FontId(0));
-            let em_width = request.font_size
-                * self
-                    .advance(FontId(0), self.glyph_for_char(FontId(0), 'm').unwrap())
-                    .unwrap()
-                    .width
-                / metrics.units_per_em as f32;
+            let em_width = self.em_width(request.font_size);
             let baseline = request
                 .boxes
                 .iter()
@@ -1730,12 +1761,17 @@ mod tests {
                 .fold(request.line_height, Pixels::max);
             let positioned_boxes = position_test_inline_boxes(request, em_width, baseline);
             add_test_inline_box_advances(&mut layout, request);
-            let line_width = request.wrap_width.unwrap_or(Pixels::MAX).min(layout.width);
+            let line_width = request
+                .options
+                .wrap_width
+                .unwrap_or(Pixels::MAX)
+                .min(layout.width);
+            let line_offset = layout.visual_lines[0].offset;
             let mut inline = InlineLayout {
                 size: size(layout.width, baseline),
                 layout: Arc::new(layout),
                 lines: [InlineVisualLine {
-                    origin: Point::default(),
+                    origin: point(line_offset, Pixels::ZERO),
                     size: size(line_width, baseline),
                     baseline,
                 }]
@@ -1855,6 +1891,52 @@ impl From<RenderImageParams> for AtlasKey {
     }
 }
 
+#[doc(hidden)]
+#[derive(Default)]
+pub struct GlyphAtlasCache {
+    entries: FxHashMap<RenderGlyphParams, GlyphAtlasEntry>,
+}
+
+impl GlyphAtlasCache {
+    pub fn get(&self, params: &RenderGlyphParams) -> Option<GlyphAtlasEntry> {
+        self.entries.get(params).copied()
+    }
+
+    pub fn insert(
+        &mut self,
+        params: &RenderGlyphParams,
+        glyph: &RasterizedGlyph,
+        tile: Option<AtlasTile>,
+    ) -> GlyphAtlasEntry {
+        let entry = GlyphAtlasEntry {
+            tile,
+            bounds: glyph.bounds,
+            format: glyph.format,
+        };
+        self.entries.insert(params.clone(), entry);
+
+        entry
+    }
+
+    pub fn remove(&mut self, key: &AtlasKey) {
+        let AtlasKey::Glyph { params, format } = key else {
+            return;
+        };
+
+        if self
+            .entries
+            .get(params)
+            .is_some_and(|entry| entry.format == *format)
+        {
+            self.entries.remove(params);
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
 #[expect(missing_docs)]
 pub trait PlatformAtlas {
     fn get_or_insert_with<'a>(
@@ -1862,6 +1944,12 @@ pub trait PlatformAtlas {
         key: &AtlasKey,
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
+    /// On a cache miss, `build` returns a validated glyph for atlas insertion.
+    fn get_or_insert_glyph_with(
+        &self,
+        params: &RenderGlyphParams,
+        build: &mut dyn FnMut() -> Result<ValidatedRasterizedGlyph>,
+    ) -> Result<GlyphAtlasEntry>;
     fn remove(&self, key: &AtlasKey);
 
     #[cfg(any(test, feature = "test-support", feature = "bench-support"))]

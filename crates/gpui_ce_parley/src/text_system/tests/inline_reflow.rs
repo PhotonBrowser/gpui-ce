@@ -30,7 +30,7 @@ struct InlineTranslationView {
 }
 
 impl Render for InlineTranslationView {
-    fn render(&mut self, _window: &mut Window, _context: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().pl(px(11.)).pt(px(9.)).child(
             div()
                 .block()
@@ -77,11 +77,10 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn read(context: &mut HeadlessAppContext, window: WindowHandle<InlineTranslationView>) -> Self {
+    fn read(cx: &mut HeadlessAppContext, window: WindowHandle<InlineTranslationView>) -> Self {
         let any_window = window.into();
         let mut debug_bounds = |selector| {
-            context
-                .debug_bounds(any_window, selector)
+            cx.debug_bounds(any_window, selector)
                 .unwrap()
                 .unwrap_or_else(|| panic!("missing debug bounds for {selector}"))
         };
@@ -92,8 +91,8 @@ impl Geometry {
         let nested = debug_bounds(NESTED);
 
         let text_groups = [
-            text_group_bounds(context, any_window, first_group_color()),
-            text_group_bounds(context, any_window, second_group_color()),
+            text_group_bounds(cx, any_window, first_group_color()),
+            text_group_bounds(cx, any_window, second_group_color()),
         ];
 
         Self {
@@ -158,11 +157,11 @@ impl Geometry {
 }
 
 fn text_group_bounds(
-    context: &mut HeadlessAppContext,
+    cx: &mut HeadlessAppContext,
     window: gpui::AnyWindowHandle,
     color: Hsla,
 ) -> Bounds<Pixels> {
-    let bounds = context.solid_quad_bounds(window, color).unwrap();
+    let bounds = cx.solid_quad_bounds(window, color).unwrap();
     assert_eq!(bounds.len(), 1, "expected one rendered quad for {color:?}");
 
     logical_bounds(bounds[0])
@@ -184,6 +183,20 @@ fn assert_point_close(actual: Point<Pixels>, expected: Point<Pixels>, context: &
     assert_close(actual.y, expected.y, context);
 }
 
+fn update_view<View: Render>(
+    cx: &mut HeadlessAppContext,
+    window: WindowHandle<View>,
+    edit: impl FnOnce(&mut View),
+) {
+    window
+        .update(cx, |view, _window, cx| {
+            edit(view);
+            cx.notify();
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
 #[test]
 fn centered_inline_lines_move_as_one_group_during_fractional_resize() {
     let text_system = ParleyTextSystem::new_with_system_font(SystemFonts::Skip, IBM_PLEX.family);
@@ -191,30 +204,26 @@ fn centered_inline_lines_move_as_one_group_during_fractional_resize() {
         .add_fonts(vec![Cow::Borrowed(IBM_PLEX.data)])
         .unwrap();
 
-    let mut context = HeadlessAppContext::new(Arc::new(text_system));
+    let mut cx = HeadlessAppContext::new(Arc::new(text_system));
 
-    let window = context
-        .open_window(size(px(340.), px(180.)), |window, context| {
+    let window = cx
+        .open_window(size(px(340.), px(180.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| InlineTranslationView { width_offset: 0. })
+            cx.new(|_| InlineTranslationView { width_offset: 0. })
         })
         .unwrap();
 
-    context.run_until_parked();
+    cx.run_until_parked();
 
-    let initial = Geometry::read(&mut context, window);
+    let initial = Geometry::read(&mut cx, window);
     initial.assert_valid();
 
     for step in 1..=64 {
-        window
-            .update(&mut context, |view, _, context| {
-                view.width_offset = step as f32 / 16.;
-                context.notify();
-            })
-            .unwrap();
-        context.run_until_parked();
+        update_view(&mut cx, window, |view| {
+            view.width_offset = step as f32 / 16.;
+        });
 
-        let translated = Geometry::read(&mut context, window);
+        let translated = Geometry::read(&mut cx, window);
         translated.assert_valid();
         translated.assert_moved_as_one_group(initial, step);
         assert_point_close(
@@ -224,14 +233,8 @@ fn centered_inline_lines_move_as_one_group_during_fractional_resize() {
         );
     }
 
-    window
-        .update(&mut context, |view, _, context| {
-            view.width_offset = 0.;
-            context.notify();
-        })
-        .unwrap();
-    context.run_until_parked();
-    assert_eq!(Geometry::read(&mut context, window), initial);
+    update_view(&mut cx, window, |view| view.width_offset = 0.);
+    assert_eq!(Geometry::read(&mut cx, window), initial);
 }
 
 fn headless() -> HeadlessAppContext {
@@ -245,12 +248,464 @@ fn headless() -> HeadlessAppContext {
     HeadlessAppContext::new(Arc::new(system))
 }
 
+type CapturedParagraphs = Rc<RefCell<Vec<(gpui::SharedString, Arc<InlineLayout>)>>>;
+
+struct ParagraphProbe {
+    element: gpui::Div,
+    painted: CapturedParagraphs,
+    measurements: CapturedParagraphs,
+    remeasure: bool,
+}
+
+impl IntoElement for ParagraphProbe {
+    type Element = Self;
+
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+impl gpui::Element for ParagraphProbe {
+    type RequestLayoutState = gpui::DivFrameState;
+    type PrepaintState = <gpui::Div as gpui::Element>::PrepaintState;
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        global_id: Option<&gpui::GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let (layout_id, state) = self
+            .element
+            .request_layout(global_id, inspector_id, window, cx);
+
+        if self.remeasure {
+            self.measurements.borrow_mut().clear();
+
+            for width in [80., 200., 2000., 80.] {
+                window.compute_layout(
+                    layout_id,
+                    size(
+                        gpui::AvailableSpace::Definite(px(width)),
+                        gpui::AvailableSpace::MaxContent,
+                    ),
+                    cx,
+                );
+                self.measurements
+                    .borrow_mut()
+                    .extend(state.measured_inline_paragraphs());
+            }
+        }
+
+        (layout_id, state)
+    }
+
+    fn prepaint(
+        &mut self,
+        global_id: Option<&gpui::GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) -> Self::PrepaintState {
+        self.element
+            .prepaint(global_id, inspector_id, bounds, state, window, cx)
+    }
+
+    fn paint(
+        &mut self,
+        global_id: Option<&gpui::GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut gpui::App,
+    ) {
+        *self.painted.borrow_mut() = state.measured_inline_paragraphs();
+        self.element
+            .paint(global_id, inspector_id, bounds, state, prepaint, window, cx);
+    }
+}
+
+const OVERFLOW_TEXT: &str =
+    "Begin café e\u{301} 👩‍👩‍👧‍👦 and several words that need room before the ending";
+const OVERFLOW_MIDDLE: &str = "WWWWWWWWWWWWWWWWWWWWWWWWWWWWWWWW";
+const LINE_CLAMP_TEXT: &str = "A paragraph can wrap at word boundaries while keeping styled text, punctuation, and spacing together. Resize the window and this sample will follow the available width.";
+
+struct OverflowParagraph {
+    text: &'static str,
+    width: f32,
+    direction: gpui::TruncateFrom,
+    max_lines: Option<usize>,
+    styled: bool,
+    marker: bool,
+    remeasure: bool,
+    painted: CapturedParagraphs,
+    measurements: CapturedParagraphs,
+}
+
+impl OverflowParagraph {
+    fn new(direction: gpui::TruncateFrom) -> Self {
+        Self {
+            text: OVERFLOW_TEXT,
+            width: 180.,
+            direction,
+            max_lines: None,
+            styled: false,
+            marker: true,
+            remeasure: false,
+            painted: Rc::default(),
+            measurements: Rc::default(),
+        }
+    }
+}
+
+impl Render for OverflowParagraph {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let mut paragraph = div()
+            .block()
+            .w_full()
+            .min_w_0()
+            .font_family("IBM Plex Sans")
+            .text_size(px(14.))
+            .line_height(px(24.))
+            .text_color(first_group_color());
+
+        if self.marker {
+            paragraph = match self.direction {
+                gpui::TruncateFrom::End => paragraph.text_ellipsis(),
+                gpui::TruncateFrom::Start => paragraph.text_ellipsis_start(),
+                gpui::TruncateFrom::Middle => paragraph.text_ellipsis_middle(),
+            };
+        }
+
+        paragraph = if let Some(count) = self.max_lines {
+            paragraph.line_clamp(count)
+        } else {
+            paragraph.whitespace_nowrap()
+        };
+
+        paragraph = if self.styled {
+            paragraph.child(
+                div()
+                    .inline()
+                    .bg(first_group_color())
+                    .child("begin ")
+                    .child(
+                        div()
+                            .inline()
+                            .text_size(px(30.))
+                            .line_height(px(46.))
+                            .text_color(second_group_color())
+                            .bg(second_group_color())
+                            .child(OVERFLOW_MIDDLE),
+                    )
+                    .child(" end"),
+            )
+        } else {
+            paragraph.child(self.text)
+        };
+
+        div()
+            .size_full()
+            .items_start()
+            .child(div().w(px(self.width)).child(ParagraphProbe {
+                element: paragraph,
+                painted: self.painted.clone(),
+                measurements: self.measurements.clone(),
+                remeasure: self.remeasure,
+            }))
+    }
+}
+
+fn assert_paragraph_fits(text: &str, layout: &InlineLayout, width: f32, max_lines: usize) {
+    assert_eq!(layout.layout.len, text.len());
+    assert!(
+        layout.lines.len() <= max_lines,
+        "{text:?}: {:?}",
+        layout.lines
+    );
+    assert!(
+        layout.layout.platform_layout.size().width <= px(width + 0.01),
+        "{text:?}: {:?}",
+        layout.layout.visual_lines
+    );
+}
+
+#[test]
+fn block_paragraph_paints_grapheme_safe_end_start_and_middle_ellipsis() {
+    let mut cx = headless();
+
+    for direction in [
+        gpui::TruncateFrom::End,
+        gpui::TruncateFrom::Start,
+        gpui::TruncateFrom::Middle,
+    ] {
+        let view = OverflowParagraph::new(direction);
+        let painted = view.painted.clone();
+        let window = cx
+            .open_window(size(px(360.), px(180.)), |window, cx| {
+                window.set_scale_factor(SCALE_FACTOR);
+
+                cx.new(|_cx| view)
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let captured = painted.borrow();
+        assert_eq!(captured.len(), 1);
+        let (text, layout) = &captured[0];
+        assert_paragraph_fits(text, layout, 180., 1);
+        let (prefix, suffix) = text
+            .split_once('…')
+            .expect("paragraph must paint the marker");
+        assert!(OVERFLOW_TEXT.starts_with(prefix) && OVERFLOW_TEXT.ends_with(suffix));
+        let boundaries: Vec<_> = OVERFLOW_TEXT
+            .grapheme_indices(true)
+            .map(|(idx, _grapheme)| idx)
+            .chain([OVERFLOW_TEXT.len()])
+            .collect();
+        assert!(boundaries.contains(&prefix.len()));
+        assert!(boundaries.contains(&(OVERFLOW_TEXT.len() - suffix.len())));
+
+        match direction {
+            gpui::TruncateFrom::End => assert!(suffix.is_empty() && !prefix.is_empty()),
+            gpui::TruncateFrom::Start => assert!(prefix.is_empty() && !suffix.is_empty()),
+            gpui::TruncateFrom::Middle => assert!(!prefix.is_empty() && !suffix.is_empty()),
+        }
+
+        assert!(
+            !cx.glyph_bounds(window.into(), first_group_color())
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn block_paragraph_places_requested_marker_on_second_clamped_line() {
+    let mut cx = headless();
+    let mut view = OverflowParagraph::new(gpui::TruncateFrom::End);
+    view.max_lines = Some(2);
+    view.width = 140.;
+    let painted = view.painted.clone();
+    let window = cx
+        .open_window(size(px(360.), px(180.)), |_window, cx| cx.new(|_cx| view))
+        .unwrap();
+    cx.run_until_parked();
+
+    {
+        let captured = painted.borrow();
+        let (text, layout) = &captured[0];
+        assert_paragraph_fits(text, layout, 140., 2);
+        assert_eq!(layout.lines.len(), 2);
+        assert!(text.ends_with('…'));
+        assert!(
+            layout.layout.visual_lines[1]
+                .text_range
+                .contains(&(text.len() - '…'.len_utf8()))
+        );
+        let geometry = layout
+            .layout
+            .platform_layout
+            .inline_geometry_for_ranges(&[text.len() - '…'.len_utf8()..text.len()]);
+        assert!(!geometry[0].is_empty());
+        assert!(
+            geometry[0]
+                .iter()
+                .all(|geometry| geometry.visual_line_index == 1)
+        );
+    }
+
+    window
+        .update(&mut cx, |view, _window, cx| {
+            view.marker = false;
+            cx.notify();
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let captured = painted.borrow();
+    assert_eq!(captured[0].0.as_ref(), OVERFLOW_TEXT);
+    assert_eq!(captured[0].1.lines.len(), 2);
+}
+
+#[test]
+fn block_line_clamp_ignores_wrapped_trailing_whitespace() {
+    let system = test_system();
+    let runs = [text_run(LINE_CLAMP_TEXT, "IBM Plex Sans")];
+    let width = (300..800)
+        .map(|width| px(width as f32))
+        .find(|width| {
+            let layout = system.layout_text(TextLayoutRequest {
+                text: LINE_CLAMP_TEXT,
+                font_size: px(14.),
+                runs: &runs,
+                options: TextLayoutOptions {
+                    wrap_width: Some(*width),
+                    text_align: TextAlign::Left,
+                    ..Default::default()
+                },
+            });
+
+            layout.visual_lines.len() == 2
+                && layout.platform_layout.size().width <= *width + px(0.01)
+                && layout
+                    .visual_lines
+                    .iter()
+                    .any(|line| line.advance_width > *width + px(0.01))
+        })
+        .expect("sample text should have a two-line width with hanging whitespace");
+    let mut cx = headless();
+    let mut view = OverflowParagraph::new(gpui::TruncateFrom::End);
+    view.text = LINE_CLAMP_TEXT;
+    view.max_lines = Some(2);
+    view.width = f32::from(width);
+    let painted = view.painted.clone();
+    cx.open_window(size(px(900.), px(180.)), |_window, cx| cx.new(|_cx| view))
+        .unwrap();
+    cx.run_until_parked();
+
+    let captured = painted.borrow();
+    let (text, layout) = &captured[0];
+    assert_eq!(text.as_ref(), LINE_CLAMP_TEXT);
+    assert_paragraph_fits(text, layout, f32::from(width), 2);
+}
+
+#[test]
+fn block_paragraph_remeasures_nowrap_overflow_and_restores_original_text() {
+    let mut cx = headless();
+    let mut view = OverflowParagraph::new(gpui::TruncateFrom::Middle);
+    view.remeasure = true;
+    let painted = view.painted.clone();
+    let measurements = view.measurements.clone();
+    let window = cx
+        .open_window(size(px(2200.), px(180.)), |_window, cx| cx.new(|_cx| view))
+        .unwrap();
+    cx.run_until_parked();
+
+    {
+        let measured = measurements.borrow();
+        assert_eq!(measured.len(), 4);
+        assert!(measured[0].0.len() < measured[1].0.len());
+        assert_eq!(measured[2].0.as_ref(), OVERFLOW_TEXT);
+        assert_eq!(measured[0].0, measured[3].0);
+
+        for ((text, layout), width) in measured.iter().zip([80., 200., 2000., 80.]) {
+            assert_paragraph_fits(text, layout, width, 1);
+        }
+    }
+
+    let initial = painted.borrow()[0].0.clone();
+
+    for width in [90., 2000., 180.] {
+        update_view(&mut cx, window, |view| view.width = width);
+        let captured = painted.borrow();
+        assert_paragraph_fits(&captured[0].0, &captured[0].1, width, 1);
+
+        if width == 2000. {
+            assert_eq!(captured[0].0.as_ref(), OVERFLOW_TEXT);
+        }
+    }
+
+    assert_eq!(painted.borrow()[0].0, initial);
+}
+
+#[test]
+fn block_ellipsis_preserves_span_metrics_and_only_places_display_ranges() {
+    let mut cx = headless();
+    let mut view = OverflowParagraph::new(gpui::TruncateFrom::Middle);
+    view.styled = true;
+    view.width = 260.;
+    let painted = view.painted.clone();
+    let window = cx
+        .open_window(size(px(360.), px(180.)), |window, cx| {
+            window.set_scale_factor(SCALE_FACTOR);
+
+            cx.new(|_cx| view)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    for width in [260., 100., 260.] {
+        update_view(&mut cx, window, |view| view.width = width);
+
+        let captured = painted.borrow();
+        let (text, layout) = &captured[0];
+        assert_paragraph_fits(text, layout, width, 1);
+        assert!(text.contains('…') && text.ends_with("end"));
+        let spans = quads(&mut cx, window.into(), first_group_color());
+        assert_eq!(spans.len(), 1);
+        assert_close(
+            spans[0].size.width,
+            px((f32::from(layout.size.width) * SCALE_FACTOR).round() / SCALE_FACTOR),
+            "outer span covers the displayed prefix and suffix",
+        );
+        assert_close(
+            spans[0].size.height,
+            px((f32::from(layout.size.height) * SCALE_FACTOR).round() / SCALE_FACTOR),
+            "outer span uses the displayed line height",
+        );
+
+        if width == 100. {
+            assert!(!text.contains('W'));
+            assert!(quads(&mut cx, window.into(), second_group_color()).is_empty());
+            assert!(
+                cx.glyph_bounds(window.into(), second_group_color())
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(layout.size.height < px(46.));
+        } else {
+            assert!(layout.size.height >= px(46.));
+            assert!(
+                layout
+                    .layout
+                    .paint_fragments
+                    .iter()
+                    .any(|fragment| fragment.font_size == px(30.))
+            );
+            assert!(
+                layout
+                    .layout
+                    .paint_fragments
+                    .iter()
+                    .any(|fragment| fragment.font_size == px(14.))
+            );
+            let backgrounds = quads(&mut cx, window.into(), second_group_color());
+            assert!(!backgrounds.is_empty());
+
+            for glyph in cx
+                .glyph_bounds(window.into(), second_group_color())
+                .unwrap()
+            {
+                assert!(
+                    backgrounds
+                        .iter()
+                        .any(|bounds| bounds.contains(&logical_bounds(glyph).center()))
+                );
+            }
+        }
+    }
+}
+
 fn quads(
-    context: &mut HeadlessAppContext,
+    cx: &mut HeadlessAppContext,
     window: gpui::AnyWindowHandle,
     color: Hsla,
 ) -> Vec<Bounds<Pixels>> {
-    let mut bounds: Vec<_> = context
+    let mut bounds: Vec<_> = cx
         .solid_quad_bounds(window, color)
         .unwrap()
         .into_iter()
@@ -335,20 +790,20 @@ impl Render for NestedWrapping {
 
 #[test]
 fn nested_spans_wrap_like_flat_styled_text_without_boundary_breaks() {
-    let mut context = headless();
-    let nested = context
-        .open_window(size(px(360.), px(300.)), |window, context| {
+    let mut cx = headless();
+    let nested = cx
+        .open_window(size(px(360.), px(300.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| NestedWrapping {
+            cx.new(|_| NestedWrapping {
                 width: 130.,
                 flat: false,
             })
         })
         .unwrap();
-    let flat = context
-        .open_window(size(px(360.), px(300.)), |window, context| {
+    let flat = cx
+        .open_window(size(px(360.), px(300.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| NestedWrapping {
+            cx.new(|_| NestedWrapping {
                 width: 130.,
                 flat: true,
             })
@@ -358,23 +813,23 @@ fn nested_spans_wrap_like_flat_styled_text_without_boundary_breaks() {
     for width in [130., 179., 240., 310.] {
         for window in [nested, flat] {
             window
-                .update(&mut context, |view, _, context| {
+                .update(&mut cx, |view, _, cx| {
                     view.width = width;
-                    context.notify();
+                    cx.notify();
                 })
                 .unwrap();
         }
 
-        context.run_until_parked();
+        cx.run_until_parked();
         assert_eq!(
-            context.debug_bounds(nested.into(), "paragraph").unwrap(),
-            context.debug_bounds(flat.into(), "paragraph").unwrap()
+            cx.debug_bounds(nested.into(), "paragraph").unwrap(),
+            cx.debug_bounds(flat.into(), "paragraph").unwrap()
         );
 
         for color in [first_group_color(), second_group_color()] {
             assert_eq!(
-                quads(&mut context, nested.into(), color),
-                quads(&mut context, flat.into(), color),
+                quads(&mut cx, nested.into(), color),
+                quads(&mut cx, flat.into(), color),
                 "width {width}"
             );
         }
@@ -431,7 +886,7 @@ impl Render for ContextView {
 
 #[test]
 fn inline_sizing_depends_on_parent_context() {
-    let mut context = headless();
+    let mut cx = headless();
 
     for parent_context in [
         ParentContext::Block,
@@ -439,33 +894,33 @@ fn inline_sizing_depends_on_parent_context() {
         ParentContext::Flex,
         ParentContext::Grid,
     ] {
-        let window = context
-            .open_window(size(px(300.), px(240.)), |window, context| {
+        let window = cx
+            .open_window(size(px(300.), px(240.)), |window, cx| {
                 window.set_scale_factor(SCALE_FACTOR);
-                context.new(|_| ContextView {
+                cx.new(|_| ContextView {
                     context: parent_context,
                 })
             })
             .unwrap();
-        context.run_until_parked();
+        cx.run_until_parked();
 
-        let span = context
+        let span = cx
             .debug_bounds(window.into(), "context-inline")
             .unwrap()
             .unwrap();
-        let badge = context
+        let badge = cx
             .debug_bounds(window.into(), "context-badge")
             .unwrap()
             .unwrap();
 
         match parent_context {
-            ParentContext::Block => {
+            ParentContext::Block | ParentContext::Default => {
                 assert!(span.size.width > px(80.));
                 assert!(span.size.height >= px(48.));
                 assert!(badge.origin.y > span.origin.y);
             }
 
-            _ => {
+            ParentContext::Flex | ParentContext::Grid => {
                 assert_close(span.size.width, px(80.), "independent inline width");
                 assert!((span.size.height - px(31.)).abs() < px(1.));
                 assert!(badge.origin.x >= span.right());
@@ -523,24 +978,24 @@ impl Render for MixedFlow {
 
 #[test]
 fn blocks_split_nested_spans_and_hidden_absolute_empty_children_add_no_rows() {
-    let mut context = headless();
+    let mut cx = headless();
 
-    let window = context
-        .open_window(size(px(300.), px(240.)), |window, context| {
+    let window = cx
+        .open_window(size(px(300.), px(240.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| MixedFlow)
+            cx.new(|_| MixedFlow)
         })
         .unwrap();
-    context.run_until_parked();
+    cx.run_until_parked();
 
-    let fragments = quads(&mut context, window.into(), first_group_color());
+    let fragments = quads(&mut cx, window.into(), first_group_color());
     assert_eq!(fragments.len(), 2);
 
-    let block = context
+    let block = cx
         .debug_bounds(window.into(), "inner-block")
         .unwrap()
         .unwrap();
-    let following = context
+    let following = cx
         .debug_bounds(window.into(), "following-block")
         .unwrap()
         .unwrap();
@@ -557,10 +1012,7 @@ fn blocks_split_nested_spans_and_hidden_absolute_empty_children_add_no_rows() {
     );
     assert_close(following.origin.y, fragments[1].bottom(), "no phantom rows");
 
-    let paragraph = context
-        .debug_bounds(window.into(), "mixed")
-        .unwrap()
-        .unwrap();
+    let paragraph = cx.debug_bounds(window.into(), "mixed").unwrap().unwrap();
     assert_close(
         paragraph.bottom(),
         following.bottom(),
@@ -629,59 +1081,38 @@ impl Render for AtomicFlow {
 
 #[test]
 fn inline_flex_and_box_only_spans_move_as_atomic_content() {
-    let mut context = headless();
+    let mut cx = headless();
 
-    let window = context
-        .open_window(size(px(340.), px(240.)), |window, context| {
+    let window = cx
+        .open_window(size(px(340.), px(240.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| AtomicFlow { width: 150. })
+            cx.new(|_| AtomicFlow { width: 150. })
         })
         .unwrap();
     let mut previous = None;
 
     for width in [150., 290.] {
-        window
-            .update(&mut context, |view, _, context| {
-                view.width = width;
-                context.notify();
-            })
-            .unwrap();
-        context.run_until_parked();
+        update_view(&mut cx, window, |view| view.width = width);
 
-        let badge = context
-            .debug_bounds(window.into(), "badge")
-            .unwrap()
-            .unwrap();
-        let span = context
-            .debug_bounds(window.into(), "box-span")
-            .unwrap()
-            .unwrap();
+        let badge = cx.debug_bounds(window.into(), "badge").unwrap().unwrap();
+        let span = cx.debug_bounds(window.into(), "box-span").unwrap().unwrap();
 
-        let left = context
-            .debug_bounds(window.into(), "badge-a")
-            .unwrap()
-            .unwrap();
-        let right = context
-            .debug_bounds(window.into(), "badge-b")
-            .unwrap()
-            .unwrap();
+        let left = cx.debug_bounds(window.into(), "badge-a").unwrap().unwrap();
+        let right = cx.debug_bounds(window.into(), "badge-b").unwrap().unwrap();
 
-        let icon_span = context
+        let icon_span = cx
             .debug_bounds(window.into(), "icon-span")
             .unwrap()
             .unwrap();
-        let image = context
-            .debug_bounds(window.into(), "image")
-            .unwrap()
-            .unwrap();
-        let svg = context.debug_bounds(window.into(), "svg").unwrap().unwrap();
+        let image = cx.debug_bounds(window.into(), "image").unwrap().unwrap();
+        let svg = cx.debug_bounds(window.into(), "svg").unwrap().unwrap();
 
         assert_bounds_close(icon_span, image.union(&svg), "box-only span bounds");
         assert_close(image.size.width, px(12.), "inline image stays atomic");
         assert_close(svg.size.width, px(14.), "inline SVG stays atomic");
         assert_bounds_close(span, badge, "badge span bounds");
 
-        let backgrounds = quads(&mut context, window.into(), first_group_color());
+        let backgrounds = quads(&mut cx, window.into(), first_group_color());
         assert_eq!(backgrounds.len(), 1);
         assert_bounds_close(backgrounds[0], badge, "badge span background");
 
@@ -744,10 +1175,10 @@ impl gpui::Element for LifecycleProbe {
         _: Option<&gpui::GlobalElementId>,
         _: Option<&gpui::InspectorElementId>,
         window: &mut Window,
-        context: &mut gpui::App,
+        cx: &mut gpui::App,
     ) -> (gpui::LayoutId, ()) {
         self.counts[1].set(self.counts[1].get() + 1);
-        (self.element.request_layout(window, context), ())
+        (self.element.request_layout(window, cx), ())
     }
 
     fn prepaint(
@@ -757,10 +1188,10 @@ impl gpui::Element for LifecycleProbe {
         _: Bounds<Pixels>,
         _: &mut (),
         window: &mut Window,
-        context: &mut gpui::App,
+        cx: &mut gpui::App,
     ) {
         self.counts[2].set(self.counts[2].get() + 1);
-        self.element.prepaint(window, context);
+        self.element.prepaint(window, cx);
     }
 
     fn paint(
@@ -771,10 +1202,10 @@ impl gpui::Element for LifecycleProbe {
         _: &mut (),
         _: &mut (),
         window: &mut Window,
-        context: &mut gpui::App,
+        cx: &mut gpui::App,
     ) {
         self.counts[3].set(self.counts[3].get() + 1);
-        self.element.paint(window, context);
+        self.element.paint(window, cx);
     }
 }
 
@@ -812,14 +1243,14 @@ impl Render for InteractiveFlow {
                 span.inline_flex().w(px(100.)).h(px(110.))
             })
             .on_hover(move |value, _, _| hovered.set(*value))
-            .tooltip(|_, context| context.new(|_| InlineTooltip).into())
+            .tooltip(|_, cx| cx.new(|_| InlineTooltip).into())
             .tooltip_show_delay(std::time::Duration::from_millis(10))
             .track_focus(&self.focus)
             .bg(first_group_color())
             .debug_selector(|| "interactive-span".into())
-            .on_click(move |_, window, context| {
+            .on_click(move |_, window, cx| {
                 clicks.set(clicks.get() + 1);
-                focus.focus(window, context);
+                focus.focus(window, cx);
             })
             .child(gpui::text!(
                 "these words can wrap across several lines with a short ending"
@@ -855,36 +1286,35 @@ impl Render for InteractiveFlow {
     }
 }
 
-fn click(context: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, position: Point<Pixels>) {
-    context
-        .update_window(window, |_, window, context| {
-            window.simulate_mouse_move(position, context);
-            window.dispatch_event(
-                gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
-                    position,
-                    button: gpui::MouseButton::Left,
-                    click_count: 1,
-                    ..Default::default()
-                }),
-                context,
-            );
-            window.dispatch_event(
-                gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
-                    position,
-                    button: gpui::MouseButton::Left,
-                    click_count: 1,
-                    ..Default::default()
-                }),
-                context,
-            );
-        })
-        .unwrap();
-    context.run_until_parked();
+fn click(cx: &mut HeadlessAppContext, window: gpui::AnyWindowHandle, position: Point<Pixels>) {
+    cx.update_window(window, |_, window, cx| {
+        window.simulate_mouse_move(position, cx);
+        window.dispatch_event(
+            gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+        window.dispatch_event(
+            gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                position,
+                button: gpui::MouseButton::Left,
+                click_count: 1,
+                ..Default::default()
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
 }
 
 #[test]
 fn fragment_interaction_reflows_scrolls_and_preserves_wrapped_element_lifecycle() {
-    let mut context = headless();
+    let mut cx = headless();
     let clicks = Rc::new(Cell::new(0));
     let hovered = Rc::new(Cell::new(false));
 
@@ -892,12 +1322,12 @@ fn fragment_interaction_reflows_scrolls_and_preserves_wrapped_element_lifecycle(
     let callback = Rc::new(RefCell::new(Vec::new()));
 
     let scroll = gpui::ScrollHandle::new();
-    let focus = context.update(|context| context.focus_handle());
+    let focus = cx.update(|cx| cx.focus_handle());
 
-    let window = context
-        .open_window(size(px(350.), px(300.)), |window, context| {
+    let window = cx
+        .open_window(size(px(350.), px(300.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| InteractiveFlow {
+            cx.new(|_| InteractiveFlow {
                 width: 190.,
                 large: false,
                 atomic: false,
@@ -910,9 +1340,9 @@ fn fragment_interaction_reflows_scrolls_and_preserves_wrapped_element_lifecycle(
             })
         })
         .unwrap();
-    context.run_until_parked();
+    cx.run_until_parked();
 
-    let regions = quads(&mut context, window.into(), first_group_color());
+    let regions = quads(&mut cx, window.into(), first_group_color());
     assert!(regions.len() >= 3);
 
     let union = regions
@@ -924,24 +1354,19 @@ fn fragment_interaction_reflows_scrolls_and_preserves_wrapped_element_lifecycle(
     assert_eq!(callback.borrow().len(), 3);
     assert_eq!(callback.borrow()[1], union);
 
-    click(&mut context, window.into(), regions[0].center());
-    click(
-        &mut context,
-        window.into(),
-        regions.last().unwrap().center(),
-    );
+    click(&mut cx, window.into(), regions[0].center());
+    click(&mut cx, window.into(), regions.last().unwrap().center());
     assert_eq!(clicks.get(), 2);
     assert!(hovered.get());
     assert!(
-        context
-            .update_window(window.into(), |_, window, _| focus.is_focused(window))
+        cx.update_window(window.into(), |_, window, _| focus.is_focused(window))
             .unwrap()
     );
 
     let gap = gpui::point(regions[0].origin.x / 2., regions[0].center().y);
     assert!(union.contains(&gap) && !regions.iter().any(|right| right.contains(&gap)));
 
-    click(&mut context, window.into(), gap);
+    click(&mut cx, window.into(), gap);
     assert_eq!(
         clicks.get(),
         2,
@@ -950,78 +1375,72 @@ fn fragment_interaction_reflows_scrolls_and_preserves_wrapped_element_lifecycle(
 
     assert!(!hovered.get());
 
-    context
-        .update_window(window.into(), |_, window, context| {
-            window.simulate_mouse_move(regions[0].center(), context)
-        })
-        .unwrap();
-    context.run_until_parked();
-    context.advance_clock(std::time::Duration::from_millis(20));
-    context.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.simulate_mouse_move(regions[0].center(), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.advance_clock(std::time::Duration::from_millis(20));
+    cx.run_until_parked();
     assert!(
-        context
-            .debug_bounds(window.into(), "inline-tooltip")
+        cx.debug_bounds(window.into(), "inline-tooltip")
             .unwrap()
             .is_some()
     );
 
-    context
-        .update_window(window.into(), |_, window, context| {
-            window.simulate_mouse_move(gap, context)
-        })
-        .unwrap();
-    context.run_until_parked();
-    context.advance_clock(std::time::Duration::from_secs(1));
-    context.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.simulate_mouse_move(gap, cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
     assert!(
-        context
-            .debug_bounds(window.into(), "inline-tooltip")
+        cx.debug_bounds(window.into(), "inline-tooltip")
             .unwrap()
             .is_none()
     );
 
     window
-        .update(&mut context, |view, _, context| {
+        .update(&mut cx, |view, _, cx| {
             view.width = 250.;
             view.large = true;
-            context.notify();
+            cx.notify();
         })
         .unwrap();
-    context.run_until_parked();
+    cx.run_until_parked();
 
-    let resized = quads(&mut context, window.into(), first_group_color());
+    let resized = quads(&mut cx, window.into(), first_group_color());
     assert_ne!(resized, regions);
     assert!(resized.iter().any(|right| right.size.height >= px(34.)));
 
-    click(&mut context, window.into(), resized[1].center());
+    click(&mut cx, window.into(), resized[1].center());
     assert_eq!(clicks.get(), 3);
 
     scroll.set_offset(gpui::point(px(0.), px(-24.)));
-    window
-        .update(&mut context, |_, _, context| context.notify())
-        .unwrap();
-    context.run_until_parked();
+    window.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    cx.run_until_parked();
 
-    let scrolled = quads(&mut context, window.into(), first_group_color());
+    let scrolled = quads(&mut cx, window.into(), first_group_color());
     assert_close(
         scrolled[1].origin.y,
         resized[1].origin.y - px(24.),
         "scroll updates fragment origin",
     );
 
-    click(&mut context, window.into(), scrolled[1].center());
+    click(&mut cx, window.into(), scrolled[1].center());
     assert_eq!(clicks.get(), 4);
 
     scroll.set_offset(Point::default());
     window
-        .update(&mut context, |view, _, context| {
+        .update(&mut cx, |view, _, cx| {
             view.atomic = true;
-            context.notify();
+            cx.notify();
         })
         .unwrap();
-    context.run_until_parked();
+    cx.run_until_parked();
 
-    let atomic = context
+    let atomic = cx
         .debug_bounds(window.into(), "interactive-span")
         .unwrap()
         .unwrap();
@@ -1097,23 +1516,23 @@ impl Render for MixedTypography {
 
 #[test]
 fn mixed_font_sizes_colors_and_underlines_paint_in_their_wrapped_rows() {
-    let mut context = headless();
+    let mut cx = headless();
 
-    let window = context
-        .open_window(size(px(320.), px(300.)), |window, context| {
+    let window = cx
+        .open_window(size(px(320.), px(300.)), |window, cx| {
             window.set_scale_factor(SCALE_FACTOR);
-            context.new(|_| MixedTypography)
+            cx.new(|_| MixedTypography)
         })
         .unwrap();
-    context.run_until_parked();
+    cx.run_until_parked();
 
     let mut glyph_heights = Vec::new();
 
     for color in [first_group_color(), second_group_color()] {
-        let backgrounds = quads(&mut context, window.into(), color);
+        let backgrounds = quads(&mut cx, window.into(), color);
         assert!(!backgrounds.is_empty());
 
-        let underlines: Vec<_> = context
+        let underlines: Vec<_> = cx
             .underline_bounds(window.into(), color)
             .unwrap()
             .into_iter()
@@ -1134,7 +1553,7 @@ fn mixed_font_sizes_colors_and_underlines_paint_in_their_wrapped_rows() {
             );
         }
 
-        let glyphs: Vec<_> = context
+        let glyphs: Vec<_> = cx
             .glyph_bounds(window.into(), color)
             .unwrap()
             .into_iter()
@@ -1159,7 +1578,7 @@ fn mixed_font_sizes_colors_and_underlines_paint_in_their_wrapped_rows() {
         );
     }
 
-    assert!(quads(&mut context, window.into(), first_group_color()).len() >= 2);
+    assert!(quads(&mut cx, window.into(), first_group_color()).len() >= 2);
     assert!(
         glyph_heights[0] > glyph_heights[1] * 1.5,
         "glyph painting must use each shaped run's font size"

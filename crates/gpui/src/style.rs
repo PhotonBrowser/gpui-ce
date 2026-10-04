@@ -239,6 +239,16 @@ pub struct Style {
     /// Should the element be painted on screen?
     pub visibility: Visibility,
 
+    /// The inline direction of this element and its descendants.
+    pub direction: LayoutDirection,
+
+    /// How this element participates in Unicode bidirectional text formatting.
+    pub unicode_bidi: UnicodeBidi,
+
+    /// Whether `unicode_bidi` was authored rather than supplied by its initial value.
+    #[doc(hidden)]
+    pub unicode_bidi_explicit: bool,
+
     // Overflow properties
     /// How children overflowing their container should affect layout
     #[refineable]
@@ -428,6 +438,67 @@ pub enum Visibility {
     Hidden,
 }
 
+/// The inline direction established by an element.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum LayoutDirection {
+    /// Use the resolved direction of the logical parent.
+    #[default]
+    Inherit,
+    /// Establish left-to-right directionality.
+    LeftToRight,
+    /// Establish right-to-left directionality.
+    RightToLeft,
+    /// Determine direction from eligible source text.
+    Auto,
+}
+
+/// An element direction after inheritance and automatic detection have been resolved.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum ResolvedDirection {
+    /// Left-to-right inline direction.
+    #[default]
+    LeftToRight,
+    /// Right-to-left inline direction.
+    RightToLeft,
+}
+
+impl ResolvedDirection {
+    /// Returns whether this direction is right-to-left.
+    pub fn is_rtl(self) -> bool {
+        self == Self::RightToLeft
+    }
+
+    pub(crate) fn from_first_strong(text: &str) -> Option<Self> {
+        use unicode_bidi::BidiClass;
+
+        text.chars()
+            .find_map(|character| match unicode_bidi::bidi_class(character) {
+                BidiClass::L => Some(Self::LeftToRight),
+                BidiClass::R | BidiClass::AL => Some(Self::RightToLeft),
+                _ => None,
+            })
+    }
+}
+
+/// Controls the Unicode bidirectional scope established by an element.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize, JsonSchema)]
+pub enum UnicodeBidi {
+    /// Apply ordinary bidirectional processing without another scope.
+    #[default]
+    Normal,
+    /// Establish a directional embedding.
+    Embed,
+    /// Isolate the element's inline content from surrounding content.
+    Isolate,
+    /// Override the ordering of inline content with the element direction.
+    BidiOverride,
+    /// Isolate the content and override its ordering.
+    IsolateOverride,
+    /// Determine each paragraph's direction from its own content.
+    Plaintext,
+}
+
 /// The possible values of the box-shadow property
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BoxShadow {
@@ -547,10 +618,16 @@ pub enum TextOverflow {
 }
 
 /// How to align text within the element
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 pub enum TextAlign {
-    /// Align the text to the left of the element
+    /// Align text to the start edge for the line's direction.
     #[default]
+    Start,
+
+    /// Align text to the end edge for the line's direction.
+    End,
+
+    /// Align the text to the physical left edge of the element.
     Left,
 
     /// Center the text within the element
@@ -772,6 +849,18 @@ pub struct HighlightStyle {
 }
 
 impl Style {
+    /// Resolves the initial Unicode bidi behavior against this style's direction.
+    #[doc(hidden)]
+    pub fn effective_unicode_bidi(&self) -> UnicodeBidi {
+        if self.unicode_bidi_explicit {
+            self.unicode_bidi
+        } else if self.direction == LayoutDirection::Inherit {
+            UnicodeBidi::Normal
+        } else {
+            UnicodeBidi::Isolate
+        }
+    }
+
     /// Returns true if the style is visible and the background is opaque.
     pub fn has_opaque_background(&self) -> bool {
         self.background
@@ -1024,8 +1113,11 @@ impl Style {
 impl Default for Style {
     fn default() -> Self {
         Style {
-            display: Display::Flex,
+            display: Display::Block,
             visibility: Visibility::Visible,
+            direction: LayoutDirection::Inherit,
+            unicode_bidi: UnicodeBidi::Normal,
+            unicode_bidi_explicit: false,
             overflow: Point {
                 x: Overflow::Visible,
                 y: Overflow::Visible,
@@ -1328,7 +1420,7 @@ pub type JustifySelf = AlignItems;
 /// Controls the vertical position of an element box in an inline formatting context.
 ///
 /// This property has no effect on ordinary block, flex, or grid layout.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub enum VerticalAlign {
     /// Align the bottom of the box with the text baseline.
     #[default]
@@ -1395,9 +1487,11 @@ pub type JustifyContent = AlignContent;
 pub enum Display {
     /// The children will follow the block layout algorithm
     Block,
+
     /// The children will follow the flexbox layout algorithm
     #[default]
     Flex,
+
     /// The children will follow the CSS Grid layout algorithm
     Grid,
 

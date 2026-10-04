@@ -1,8 +1,12 @@
-use crate::elements::div::{ScrollHandle, StackSafe};
+use crate::elements::div::ScrollHandle;
+use crate::elements::text::{
+    TruncationCandidate, text_layout_fits, truncate_with_measured_candidates,
+};
 use crate::{
-    AnyElement, App, AvailableSpace, Bounds, Display, InlineBoxRequest, InlineLayout,
+    App, AvailableSpace, Bounds, Display, InlineBidiScope, InlineBoxRequest, InlineLayout,
     InlineLayoutRequest, InlineTextMetrics, InlineTextStyle, LayoutId, Pixels, Point, Position,
-    SharedString, Size, Style, TextLayout, TextRun, TextStyle, Window, place_inline_layout, size,
+    SharedString, Size, Style, TextLayout, TextLayoutTruncation, TextRun, TextStyle, UnicodeBidi,
+    Window, WindowTextSystem, place_inline_layout, size,
 };
 
 use collections::FxHashMap;
@@ -14,6 +18,7 @@ use std::{
     rc::Rc,
     sync::Arc,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 /// Resolved content published by the element's ordinary layout request. Wrappers that return
 /// the same layout ID automatically retain this content and the element's normal lifecycle.
@@ -37,6 +42,8 @@ struct InlineSpan {
     layout_id: LayoutId,
     text_range: Range<usize>,
     box_range: Range<usize>,
+    direction: crate::taffy::LayoutDirectionHandle,
+    unicode_bidi: UnicodeBidi,
 }
 
 #[derive(Default)]
@@ -49,14 +56,129 @@ struct InlineDocument {
     spans: Vec<InlineSpan>,
 }
 
+impl InlineDocument {
+    fn bidi_scopes(&self) -> Vec<InlineBidiScope> {
+        self.spans
+            .iter()
+            .filter(|span| span.unicode_bidi != UnicodeBidi::Normal)
+            .map(|span| InlineBidiScope {
+                range: span.text_range.clone(),
+                direction: span.direction.get(),
+                unicode_bidi: span.unicode_bidi,
+            })
+            .collect()
+    }
+
+    fn layout(
+        self: &Rc<Self>,
+        request: InlineLayoutRequest<'_>,
+        truncation: &TextLayoutTruncation,
+        text_system: &WindowTextSystem,
+    ) -> (Rc<Self>, Arc<InlineLayout>) {
+        // Removing embedded widgets also requires suppressing their painting and hit regions.
+        let Some(width) = truncation.width.filter(|_width| self.boxes.is_empty()) else {
+            return (self.clone(), text_system.layout_inline(request));
+        };
+
+        let max_lines = request.options.line_clamp;
+        let request = InlineLayoutRequest {
+            options: crate::TextLayoutOptions {
+                line_clamp: None,
+                ..request.options
+            },
+            ..request
+        };
+        let probe = text_system.layout_inline(request);
+        let fits = |layout: &InlineLayout| text_layout_fits(&layout.layout, width, max_lines);
+
+        if fits(&probe) {
+            return (self.clone(), probe);
+        }
+
+        let boundaries = self
+            .text
+            .grapheme_indices(true)
+            .map(|(index, _grapheme)| index)
+            .chain(std::iter::once(self.text.len()));
+
+        let (_candidate, measurement) = truncate_with_measured_candidates(
+            &self.text,
+            boundaries,
+            None,
+            &truncation.affix,
+            &self.runs,
+            truncation.source,
+            |candidate| {
+                let document = self.truncated(candidate);
+                let bidi_scopes = document.bidi_scopes();
+                let layout = text_system.layout_inline(InlineLayoutRequest {
+                    text: &document.text,
+                    runs: &document.runs,
+                    text_styles: &document.text_styles,
+                    bidi_scopes: &bidi_scopes,
+                    ..request
+                });
+                let fits = fits(&layout);
+
+                ((Rc::new(document), layout), fits)
+            },
+        );
+
+        measurement
+    }
+
+    fn truncated(&self, candidate: &TruncationCandidate) -> Self {
+        let text_styles = self
+            .text_styles
+            .iter()
+            .flat_map(|style| {
+                candidate
+                    .display_ranges(&style.range)
+                    .into_iter()
+                    .map(|range| InlineTextStyle {
+                        range,
+                        ..style.clone()
+                    })
+            })
+            .collect();
+        let spans = self
+            .spans
+            .iter()
+            .flat_map(|span| {
+                candidate
+                    .display_ranges(&span.text_range)
+                    .into_iter()
+                    .map(|text_range| InlineSpan {
+                        layout_id: span.layout_id,
+                        text_range,
+                        box_range: 0..0,
+                        direction: span.direction.clone(),
+                        unicode_bidi: span.unicode_bidi,
+                    })
+            })
+            .collect();
+
+        Self {
+            text: candidate.text.to_string(),
+            runs: candidate.runs.clone(),
+            text_styles,
+            spans,
+            ..Self::default()
+        }
+    }
+}
+
 struct InlineParagraphMeasurement {
-    wrap_width: Option<Pixels>,
-    layout: InlineLayout,
+    truncate_width: Option<Pixels>,
+    options: crate::TextLayoutOptions,
+    bidi_scopes: Vec<InlineBidiScope>,
+    document: Rc<InlineDocument>,
+    layout: Arc<InlineLayout>,
 }
 
 struct InlineParagraph {
     layout_id: LayoutId,
-    document: Arc<InlineDocument>,
+    document: Rc<InlineDocument>,
     measurement: Rc<RefCell<Option<InlineParagraphMeasurement>>>,
     paint_origin: Point<Pixels>,
 }
@@ -81,8 +203,10 @@ pub(super) struct InlineDivFrameState {
 struct InlineParagraphCollector<'a> {
     frame_state: InlineDivFrameState,
     current_document: InlineDocument,
+    current_span_indices: FxHashMap<LayoutId, usize>,
     open_span_layout_ids: Vec<LayoutId>,
     text_style: TextStyle,
+    unicode_bidi: UnicodeBidi,
     window: &'a mut Window,
     cx: &'a mut App,
 }
@@ -181,19 +305,19 @@ impl InlineParagraphCollector<'_> {
         let text_end = self.current_document.text.len();
         let box_end = self.current_document.boxes.len();
 
-        if let Some(span) = self
-            .current_document
-            .spans
-            .iter_mut()
-            .find(|span| span.layout_id == layout_id)
-        {
+        if let Some(span_idx) = self.current_span_indices.get(&layout_id).copied() {
+            let span = &mut self.current_document.spans[span_idx];
             span.text_range.end = text_end;
             span.box_range.end = box_end;
         } else {
+            self.current_span_indices
+                .insert(layout_id, self.current_document.spans.len());
             self.current_document.spans.push(InlineSpan {
                 layout_id,
                 text_range: text_start..text_end,
                 box_range: box_start..box_end,
+                direction: self.window.layout_direction_handle(layout_id),
+                unicode_bidi: self.window.layout_directionality(layout_id).1,
             });
         }
     }
@@ -203,7 +327,8 @@ impl InlineParagraphCollector<'_> {
             return;
         }
 
-        let document = Arc::new(std::mem::take(&mut self.current_document));
+        let document = Rc::new(std::mem::take(&mut self.current_document));
+        self.current_span_indices.clear();
         let measurement = Rc::new(RefCell::new(None));
 
         let text_style = self.text_style.clone();
@@ -224,27 +349,34 @@ impl InlineParagraphCollector<'_> {
 
         let measured_document = document.clone();
         let measurement_cache = measurement.clone();
+        let unicode_bidi = self.unicode_bidi;
 
         let layout_id = self.window.request_measured_layout(
             Style {
                 display: Display::Block,
                 ..Style::default()
             },
-            move |known_dimensions, available_space, window, _context| {
-                let wrap_width = TextLayout::evaluate_wrap_width(
-                    &text_style.white_space,
+            move |known_dimensions, available_space, window, _cx| {
+                let (options, truncation) = TextLayout::layout_options(
+                    &text_style,
                     known_dimensions,
                     available_space,
+                    window.resolved_direction(),
+                    unicode_bidi,
                 );
+
+                let bidi_scopes = measured_document.bidi_scopes();
 
                 if let Some(measurement) =
                     measurement_cache.borrow().as_ref() as Option<&InlineParagraphMeasurement>
-                    && measurement.wrap_width == wrap_width
+                    && measurement.truncate_width == truncation.width
+                    && measurement.options == options
+                    && measurement.bidi_scopes == bidi_scopes
                 {
                     return measurement.layout.size;
                 }
 
-                let layout = window.text_system().layout_inline(InlineLayoutRequest {
+                let request = InlineLayoutRequest {
                     text: &measured_document.text,
                     runs: &measured_document.runs,
                     text_styles: &measured_document.text_styles,
@@ -252,15 +384,22 @@ impl InlineParagraphCollector<'_> {
                     font_size,
                     line_height,
                     text_metrics,
-                    wrap_width,
-                    line_clamp: text_style.line_clamp,
-                    text_align: text_style.text_align,
-                });
+                    options,
+                    bidi_scopes: &bidi_scopes,
+                };
+                let (document, layout) =
+                    measured_document.layout(request, &truncation, window.text_system());
 
                 let size = layout.size;
                 measurement_cache
                     .borrow_mut()
-                    .replace(InlineParagraphMeasurement { wrap_width, layout });
+                    .replace(InlineParagraphMeasurement {
+                        truncate_width: truncation.width,
+                        options,
+                        bidi_scopes,
+                        document,
+                        layout,
+                    });
 
                 size
             },
@@ -277,19 +416,36 @@ impl InlineParagraphCollector<'_> {
 }
 
 impl InlineDivFrameState {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn measured_paragraphs(&self) -> Vec<(SharedString, Arc<InlineLayout>)> {
+        self.paragraphs
+            .iter()
+            .filter_map(|paragraph| {
+                paragraph.measurement().map(|measurement| {
+                    (
+                        measurement.document.text.clone().into(),
+                        measurement.layout.clone(),
+                    )
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn request_layout(
         style: &Style,
         children: &[LayoutId],
         window: &mut Window,
-        context: &mut App,
+        cx: &mut App,
     ) -> (LayoutId, Self) {
         let mut paragraph_collector = InlineParagraphCollector {
             frame_state: Self::default(),
             current_document: InlineDocument::default(),
+            current_span_indices: FxHashMap::default(),
             open_span_layout_ids: Vec::new(),
             text_style: window.text_style(),
+            unicode_bidi: style.effective_unicode_bidi(),
             window,
-            cx: context,
+            cx,
         };
 
         for child in children {
@@ -330,6 +486,7 @@ impl InlineDivFrameState {
             };
             let origin = window.layout_bounds(paragraph.layout_id).origin;
             let layout = &measurement.layout;
+            let document = &measurement.document;
 
             let placement = place_inline_layout(origin, layout.alignment_offset, window);
             let origin = origin + placement.delta;
@@ -345,62 +502,35 @@ impl InlineDivFrameState {
                 );
             }
 
-            for span in &paragraph.document.spans {
+            let text_ranges = document
+                .spans
+                .iter()
+                .map(|span| span.text_range.clone())
+                .collect::<Vec<_>>();
+            let text_geometry = layout
+                .layout
+                .platform_layout
+                .inline_geometry_for_ranges(&text_ranges);
+            let mut boxes_by_id = vec![None; paragraph.document.box_layout_ids.len()];
+
+            for inline_box in &layout.boxes {
+                if let Some(slot) = boxes_by_id.get_mut(inline_box.id as usize) {
+                    *slot = Some(inline_box);
+                }
+            }
+
+            for (span, text_regions) in document.spans.iter().zip(text_geometry) {
                 let regions = fragments.get_mut(&span.layout_id).unwrap();
 
-                for geometry in layout
-                    .layout
-                    .platform_layout
-                    .inline_geometry(span.text_range.clone())
-                    .unwrap_or_default()
-                {
-                    let Some(line) = layout.lines.get(geometry.visual_line_index) else {
-                        continue;
-                    };
-
-                    // Selection geometry can include boxes attached to a neighboring cluster.
-                    // Remove every box first, then add exactly the boxes owned by this span.
-                    let ranges = layout
-                        .boxes
-                        .iter()
-                        .filter(|inline_box| inline_box.line_index == geometry.visual_line_index)
-                        .fold(
-                            vec![geometry.bounds.origin.x..geometry.bounds.right()],
-                            |ranges, inline_box| {
-                                let left = inline_box.bounds.origin.x;
-                                let right = inline_box.bounds.right();
-
-                                ranges
-                                    .into_iter()
-                                    .flat_map(|range| {
-                                        [
-                                            (range.start < left)
-                                                .then_some(range.start..range.end.min(left)),
-                                            (range.end > right)
-                                                .then_some(range.start.max(right)..range.end),
-                                        ]
-                                        .into_iter()
-                                        .flatten()
-                                    })
-                                    .collect()
-                            },
-                        );
-
-                    regions.extend(
-                        ranges
-                            .into_iter()
-                            .filter(|range| range.end > range.start)
-                            .map(|range| {
-                                Bounds::new(
-                                    origin + crate::point(range.start, line.origin.y),
-                                    size(range.end - range.start, line.size.height),
-                                )
-                            }),
-                    );
+                for geometry in text_regions {
+                    regions.push(Bounds::new(
+                        origin + geometry.bounds.origin,
+                        geometry.bounds.size,
+                    ));
                 }
 
-                for inline_box in &layout.boxes {
-                    if span.box_range.contains(&(inline_box.id as usize)) {
+                for box_index in span.box_range.clone() {
+                    if let Some(inline_box) = boxes_by_id.get(box_index).and_then(|slot| *slot) {
                         regions.push(Bounds::new(
                             origin + inline_box.bounds.origin,
                             inline_box.bounds.size,
@@ -443,45 +573,13 @@ impl InlineDivFrameState {
             .map_or(Size::default(), |right| right.size)
     }
 
-    pub(super) fn prepaint_children(
-        &mut self,
-        children: &mut [StackSafe<AnyElement>],
-        scroll_offset: Point<Pixels>,
-        order: Option<&[usize]>,
-        window: &mut Window,
-        context: &mut App,
-    ) {
-        window.with_element_offset(scroll_offset, |window| {
-            for paragraph in &mut self.paragraphs {
-                paragraph.paint_origin = window.layout_bounds(paragraph.layout_id).origin;
-            }
-
-            match order {
-                Some(order) => {
-                    let child_count = children.len();
-                    for index in order.iter().copied().filter(|index| *index < child_count) {
-                        children[index].prepaint(window, context);
-                    }
-                }
-                None => {
-                    for child in children {
-                        child.prepaint(window, context);
-                    }
-                }
-            }
-        })
+    pub(super) fn record_paragraph_origins(&mut self, window: &mut Window) {
+        for paragraph in &mut self.paragraphs {
+            paragraph.paint_origin = window.layout_bounds(paragraph.layout_id).origin;
+        }
     }
 
-    pub(super) fn paint_children(
-        &self,
-        children: &mut [StackSafe<AnyElement>],
-        window: &mut Window,
-        context: &mut App,
-    ) {
-        for child in children {
-            child.paint(window, context);
-        }
-
+    pub(super) fn paint_paragraphs(&self, window: &mut Window, cx: &mut App) {
         for paragraph in &self.paragraphs {
             let Some(measurement) = paragraph.measurement() else {
                 continue;
@@ -489,12 +587,10 @@ impl InlineDivFrameState {
             let layout = &measurement.layout;
 
             layout
-                .paint_background(paragraph.paint_origin, window, context)
+                .paint_background(paragraph.paint_origin, window, cx)
                 .log_err();
 
-            layout
-                .paint(paragraph.paint_origin, window, context)
-                .log_err();
+            layout.paint(paragraph.paint_origin, window, cx).log_err();
         }
     }
 }

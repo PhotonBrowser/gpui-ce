@@ -1,3 +1,18 @@
+#[cfg(test)]
+use crate::{
+    DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, Font, FontMetrics,
+    InlineLayout, InlineLayoutRequest, InputEvent, InteractiveElement, LineLayout, LongPressEvent,
+    MouseDownEvent, ParentElement, PlatformTextSystem, RasterizedGlyph, RequestFrameOptions,
+    StatefulInteractiveElement, Styled, TestApp, TestAppContext, TestTextSystem, TextLayoutRequest,
+    TouchDragEvent, TouchId, TouchPhase, canvas, div, hsla,
+};
+
+#[cfg(test)]
+use proptest::prelude::*;
+
+#[cfg(test)]
+use std::path::PathBuf;
+
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]
@@ -10,21 +25,21 @@ use crate::{
     BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode, CursorStyle, Decorations,
     DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
     Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
-    GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IsZero, KeyBinding,
-    KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex,
-    Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority, PromptButton,
-    PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels, Scene, Shadow,
-    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
-    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IntoElement, IsZero,
+    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp,
+    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton,
+    MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
+    Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
+    Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
     TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
     TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black, white,
+    Underline, UnderlineStyle, UnicodeBidi, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, px, rems, size, transparent_black, white,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -937,10 +952,10 @@ pub struct Hitbox {
     pub content_mask: ContentMask<Pixels>,
     /// Flags that specify hitbox behavior.
     pub behavior: HitboxBehavior,
-    /// Additional user-provided tags to extend behavior of the hitbox
-    pub tags: Vec<SharedString>,
     /// Disjoint regions of an inline element. `bounds` is their union.
     pub fragments: Option<Arc<[Bounds<Pixels>]>>,
+    /// Additional user-provided tags to extend behavior of the hitbox.
+    pub tags: Vec<SharedString>,
 }
 
 impl Hitbox {
@@ -1262,10 +1277,13 @@ pub struct Window {
     rem_size_override_stack: SmallVec<[Pixels; 8]>,
     pub(crate) viewport_size: Size<Pixels>,
     layout_engine: Option<TaffyLayoutEngine>,
+    pub(crate) collecting_inline: bool,
     pub(crate) current_inline_fragments: Option<Arc<[Bounds<Pixels>]>>,
     pub(crate) root: Option<AnyView>,
     pub(crate) element_id_stack: SmallVec<[ElementId; 32]>,
     pub(crate) text_style_stack: Vec<TextStyleRefinement>,
+    pub(crate) measurement_direction: ResolvedDirection,
+    pub(crate) measurement_unicode_bidi: UnicodeBidi,
     pub(crate) rendered_entity_stack: Vec<EntityId>,
     pub(crate) element_offset_stack: Vec<Point<Pixels>>,
     /// Bounds of the parent `Div` currently prepainting this element as one of its children.
@@ -2015,10 +2033,13 @@ impl Window {
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
             layout_engine: Some(TaffyLayoutEngine::new()),
+            collecting_inline: false,
             current_inline_fragments: None,
             root: None,
             element_id_stack: SmallVec::default(),
             text_style_stack: Vec::new(),
+            measurement_direction: ResolvedDirection::LeftToRight,
+            measurement_unicode_bidi: UnicodeBidi::Normal,
             rendered_entity_stack: Vec::new(),
             element_offset_stack: Vec::new(),
             style_transition_containing_bounds: None,
@@ -2381,6 +2402,20 @@ impl Window {
             style.refine(refinement);
         }
         style
+    }
+
+    /// Returns the resolved direction of the current measured or prepainted layout node.
+    ///
+    /// Custom elements can use this when direction changes intrinsic measurement or a detached
+    /// sublayout created during prepaint.
+    pub fn resolved_direction(&self) -> ResolvedDirection {
+        self.measurement_direction
+    }
+
+    /// Returns the bidirectional formatting mode of the measured layout node.
+    #[doc(hidden)]
+    pub fn resolved_unicode_bidi(&self) -> UnicodeBidi {
+        self.measurement_unicode_bidi
     }
 
     /// Check if the platform window is maximized.
@@ -2892,6 +2927,11 @@ impl Window {
     }
 
     /// Show the platform character palette.
+    ///
+    /// On macOS and Windows, opens the system character or emoji picker. On Linux,
+    /// opens an installed desktop picker (Plasma, IBus, GNOME Characters, or
+    /// KCharSelect); these pickers may require copying and pasting the selection.
+    /// Logs a warning if the platform has no available picker.
     pub fn show_character_palette(&self) {
         self.platform_window.show_character_palette();
     }
@@ -4794,7 +4834,7 @@ impl Window {
     ///
     /// The y component of the origin is the baseline of the glyph.
     /// You should generally prefer to use the [`ShapedLine::paint`](crate::ShapedLine::paint) or
-    /// [`WrappedLine::paint`](crate::WrappedLine::paint) methods in the [`TextSystem`](crate::TextSystem).
+    /// [`ShapedText::paint`](crate::ShapedText::paint) methods in the [`TextSystem`](crate::TextSystem).
     /// This method is only useful if you need to paint a single glyph that has already been shaped.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -4818,9 +4858,9 @@ impl Window {
         } else {
             GlyphRenderMode::Grayscale
         };
-        let raster_style = self
-            .text_system()
-            .prepare_raster_style(color, requested_mode);
+        let raster_style =
+            self.text_system()
+                .prepare_raster_style(font_id, glyph_id, color, requested_mode);
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -4841,45 +4881,21 @@ impl Window {
         opacity: f32,
     ) -> Result<()> {
         let text_system = self.text_system().clone();
-        let mut eager_raster = None;
-        let metadata = match text_system.raster_metadata(&params) {
-            Some(metadata) => metadata,
-            None => {
-                let rasterized = text_system.rasterize_glyph(&params)?;
-                let metadata = rasterized.metadata();
-                eager_raster = Some(rasterized);
-                metadata
-            }
-        };
-        if metadata.bounds.is_zero() {
+        let entry = self
+            .sprite_atlas
+            .get_or_insert_glyph_with(&params, &mut || text_system.rasterize_glyph(&params))?;
+        let Some(tile) = entry.tile else {
             return Ok(());
-        }
+        };
 
-        let atlas_key = (params.clone(), metadata.format).into();
-        let mut uploaded_metadata = None;
-        let Some(tile) = self.sprite_atlas.get_or_insert_with(&atlas_key, &mut || {
-            let rasterized = match eager_raster.take() {
-                Some(rasterized) => rasterized,
-                None => text_system.rasterize_glyph(&params)?,
-            };
-            uploaded_metadata = Some(rasterized.metadata());
-            if rasterized.bounds.is_zero() {
-                return Ok(None);
-            }
-            Ok(Some((rasterized.size, Cow::Owned(rasterized.pixels))))
-        })?
-        else {
-            return Ok(());
-        };
-        let metadata = uploaded_metadata.unwrap_or(metadata);
-        debug_assert_eq!(metadata.bounds.size, tile.bounds.size.map(Into::into));
+        debug_assert_eq!(entry.bounds.size, tile.bounds.size.map(Into::into));
         let bounds = Bounds {
-            origin: integer_origin + metadata.bounds.origin.map(Into::into),
+            origin: integer_origin + entry.bounds.origin.map(Into::into),
             size: tile.bounds.size.map(Into::into),
         };
         let content_mask = self.snapped_content_mask();
 
-        match metadata.format {
+        match entry.format {
             RasterizedGlyphFormat::AlphaMask => {
                 self.next_frame.scene.insert_primitive(MonochromeSprite {
                     order: 0,
@@ -4945,7 +4961,7 @@ impl Window {
     ///
     /// The y component of the origin is the baseline of the glyph.
     /// You should generally prefer to use the [`ShapedLine::paint`](crate::ShapedLine::paint) or
-    /// [`WrappedLine::paint`](crate::WrappedLine::paint) methods in the [`TextSystem`](crate::TextSystem).
+    /// [`ShapedText::paint`](crate::ShapedText::paint) methods in the [`TextSystem`](crate::TextSystem).
     /// This method is only useful if you need to paint a single emoji that has already been shaped.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
@@ -4956,14 +4972,29 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<()> {
+        self.paint_emoji_with_color(origin, font_id, glyph_id, font_size, white())
+    }
+
+    /// Paints a color glyph with an application foreground for `currentColor` layers.
+    pub fn paint_emoji_with_color(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
         let scale_factor = self.scale_factor();
         let glyph_origin = origin.scale(scale_factor);
         let (integer_origin, subpixel_variant) = quantize_color_glyph_origin(glyph_origin);
-        let raster_style = self
-            .text_system()
-            .prepare_raster_style(white(), GlyphRenderMode::Color);
+        let raster_style = self.text_system().prepare_raster_style(
+            font_id,
+            glyph_id,
+            color,
+            GlyphRenderMode::Color,
+        );
         let params = RenderGlyphParams {
             font_id,
             glyph_id,
@@ -4973,7 +5004,7 @@ impl Window {
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(integer_origin, params, white(), self.element_opacity())
+        self.paint_glyph_from_atlas(integer_origin, params, color, self.element_opacity())
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
@@ -5291,7 +5322,13 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let mut layout_engine = self.layout_engine.take().unwrap();
-        layout_engine.compute_layout(layout_id, available_space, self, cx);
+        layout_engine.compute_layout(
+            layout_id,
+            available_space,
+            self.measurement_direction,
+            self,
+            cx,
+        );
         self.layout_engine = Some(layout_engine);
     }
 
@@ -5340,10 +5377,85 @@ impl Window {
             return false;
         };
 
+        if let crate::InlineContent::Text { text, .. } = &content {
+            layout_engine.set_direction_text(node_id, text.clone());
+        }
+
         layout_engine
             .inline_content
             .insert(node_id, Arc::new(content));
         true
+    }
+
+    pub(crate) fn set_layout_logical_children(&mut self, node_id: LayoutId, children: &[LayoutId]) {
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .set_logical_children(node_id, children);
+    }
+
+    pub(crate) fn set_layout_auto_direction_hint(
+        &mut self,
+        node_id: LayoutId,
+        direction: Option<ResolvedDirection>,
+    ) {
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .set_auto_direction_hint(node_id, direction);
+    }
+
+    pub(crate) fn layout_auto_direction_contribution(
+        &self,
+        node_id: LayoutId,
+    ) -> Option<ResolvedDirection> {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .auto_direction_contribution(node_id)
+    }
+
+    pub(crate) fn layout_direction_handle(
+        &self,
+        node_id: LayoutId,
+    ) -> crate::taffy::LayoutDirectionHandle {
+        self.layout_engine
+            .as_ref()
+            .unwrap()
+            .direction_handle(node_id)
+    }
+
+    pub(crate) fn layout_directionality(
+        &self,
+        node_id: LayoutId,
+    ) -> (ResolvedDirection, UnicodeBidi) {
+        self.layout_engine.as_ref().unwrap().directionality(node_id)
+    }
+
+    pub(crate) fn with_layout_direction_context<R>(
+        &mut self,
+        node_id: LayoutId,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        let (direction, unicode_bidi) = self.layout_directionality(node_id);
+        let previous_direction = std::mem::replace(&mut self.measurement_direction, direction);
+        let previous_unicode_bidi =
+            std::mem::replace(&mut self.measurement_unicode_bidi, unicode_bidi);
+        let result = f(self);
+        self.measurement_direction = previous_direction;
+        self.measurement_unicode_bidi = previous_unicode_bidi;
+        result
+    }
+
+    /// Supplies source text used by `LayoutDirection::Auto` for a custom layout node.
+    ///
+    /// Built-in text elements register their content automatically. Call this during
+    /// `request_layout` after obtaining the node's [`LayoutId`].
+    pub fn set_layout_direction_text(&mut self, node_id: LayoutId, text: impl Into<SharedString>) {
+        self.layout_engine
+            .as_mut()
+            .unwrap()
+            .set_direction_text(node_id, text.into());
     }
 
     pub(crate) fn inline_content(&self, node_id: LayoutId) -> Option<Arc<crate::InlineContent>> {
@@ -5370,6 +5482,9 @@ impl Window {
             .get(&node_id)
             .map(|fragments| {
                 let offset = self.pixel_snap_point(self.element_offset());
+                if offset == Point::default() {
+                    return fragments.clone();
+                }
 
                 fragments
                     .iter()
@@ -5399,9 +5514,13 @@ impl Window {
         engine.place_inline(node_id, bounds, scale);
 
         if let Some(mut fragments) = fragments {
-            for fragment in &mut fragments {
-                fragment.origin -= offset;
+            // A zero offset leaves fragment origins unchanged, so skip those writes.
+            if offset != Point::default() {
+                for fragment in &mut fragments {
+                    fragment.origin -= offset;
+                }
             }
+
             engine.inline_fragments.insert(node_id, fragments.into());
         }
 
@@ -5417,9 +5536,8 @@ impl Window {
             .map(|layout_engine| layout_engine.vertical_align(layout_id))
     }
 
-    /// This method should be called during `prepaint`. You can use
-    /// the returned [Hitbox] during `paint` or in an event handler
-    /// to determine whether the inserted hitbox was the topmost.
+    /// This method should be called during `prepaint`. You can use the returned [Hitbox]
+    /// during `paint` or in an event handler to determine whether the inserted hitbox was the topmost.
     ///
     /// This method should only be called as part of the prepaint phase of element drawing.
     pub fn insert_hitbox(&mut self, bounds: Bounds<Pixels>, behavior: HitboxBehavior) -> Hitbox {
@@ -5440,16 +5558,17 @@ impl Window {
         self.invalidator.debug_assert_prepaint();
 
         let content_mask = self.content_mask();
-        let mut id = self.next_hitbox_id;
+        let hitbox_id = self.next_hitbox_id;
         self.next_hitbox_id = self.next_hitbox_id.next();
         let hitbox = Hitbox {
-            id,
+            id: hitbox_id,
             bounds,
             content_mask,
             behavior,
-            tags: Vec::default(),
             fragments: self.current_inline_fragments.clone(),
+            tags: Vec::default(),
         };
+
         self.next_frame.hitboxes.push_mut(hitbox)
     }
 
@@ -7941,35 +8060,14 @@ pub fn outline(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ContentMask, HitTest, Hitbox, HitboxBehavior, HitboxId, quantize_color_glyph_origin,
-        quantize_glyph_origin,
-    };
-    use proptest::prelude::*;
-    use std::{
-        borrow::Cow,
-        cell::{Cell, RefCell},
-        path::PathBuf,
-        rc::Rc,
-        sync::Arc,
-        time::Duration,
-    };
-
+    use super::*;
     use crate::{
-        AnyWindowHandle, AppContext as _, Background, Bounds, BoxShadow, ColorExt as _, Context,
-        DevicePixels, DispatchPhase, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths,
-        FileDragPaths, FileDropEvent, FocusHandle, Font, FontId, FontMetrics, GlyphId, ImageSource,
-        InlineLayout, InlineLayoutRequest, InputEvent as _, InteractiveElement as _, IntoElement,
-        LineLayout, LongPressEvent, MouseButton, MouseDownEvent, MouseMoveEvent, ParentElement,
-        Pixels, PlatformTextSystem, Point, RasterizedGlyph, RasterizedGlyphFormat, Render,
-        RenderGlyphParams, RenderImage, RequestFrameOptions, SUBPIXEL_VARIANTS_X,
-        SUBPIXEL_VARIANTS_Y, ScaledPixels, ShaderBool, Size, StatefulInteractiveElement as _,
-        Styled, TestApp, TestAppContext, TestTextSystem, TextLayoutRequest, TouchDragEvent,
-        TouchEvent, TouchId, TouchPhase, Window, WindowAppearance, WindowOptions, canvas, div,
-        hsla, img, linear_color_stop, linear_gradient, point, px, size, white,
+        FocusHandle, ImageSource, PreparedRasterStyle, RasterColorEffect, RasterStyleRequest,
+        ShaderBool, img, linear_color_stop, linear_gradient,
     };
     use image::{Frame as ImageFrame, ImageBuffer, Rgba};
     use smallvec::smallvec;
+    use std::sync::Mutex as StdMutex;
 
     #[test]
     fn hit_test_preserves_inline_regions_occlusion_and_metadata() {
@@ -8078,7 +8176,11 @@ mod tests {
         }
     }
 
-    struct RasterFormatTextSystem;
+    #[derive(Default)]
+    struct RasterFormatTextSystem {
+        rasterized: StdMutex<Vec<RenderGlyphParams>>,
+        fail_next: AtomicBool,
+    }
 
     impl PlatformTextSystem for RasterFormatTextSystem {
         fn add_fonts(&self, _fonts: Vec<Cow<'static, [u8]>>) -> anyhow::Result<()> {
@@ -8114,13 +8216,18 @@ mod tests {
         }
 
         fn rasterize_glyph(&self, params: &RenderGlyphParams) -> anyhow::Result<RasterizedGlyph> {
+            self.rasterized.lock().unwrap().push(params.clone());
+            if self.fail_next.swap(false, SeqCst) {
+                anyhow::bail!("injected glyph rasterization failure");
+            }
+
             let (format, pixels) = match params.glyph_id.0 {
                 1 => (RasterizedGlyphFormat::AlphaMask, vec![0, 255]),
                 2 => (
                     RasterizedGlyphFormat::BgraSubpixelMask,
                     vec![1, 2, 3, 0, 4, 5, 6, 0],
                 ),
-                3 => (
+                3 | 5 => (
                     RasterizedGlyphFormat::BgraColor,
                     vec![10, 20, 30, 128, 40, 50, 60, 255],
                 ),
@@ -8138,6 +8245,19 @@ mod tests {
             })
         }
 
+        fn prepare_raster_style(&self, mut request: RasterStyleRequest) -> PreparedRasterStyle {
+            if request.requested_mode == GlyphRenderMode::Color {
+                request.foreground_dependency = match request.glyph_id {
+                    GlyphId(3) => crate::ForegroundDependency::AlphaOnly,
+                    _glyph_id => request.foreground_dependency,
+                };
+
+                PreparedRasterStyle::preblend(request)
+            } else {
+                PreparedRasterStyle::independent(request.requested_mode)
+            }
+        }
+
         fn layout_text(&self, request: TextLayoutRequest<'_>) -> LineLayout {
             PlatformTextSystem::layout_text(&TestTextSystem, request)
         }
@@ -8150,24 +8270,44 @@ mod tests {
     struct RasterFormatView;
 
     impl Render for RasterFormatView {
-        fn render(
-            &mut self,
-            _window: &mut Window,
-            _context: &mut Context<Self>,
-        ) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             let color = hsla(0.6, 0.7, 0.4, 0.8);
+            let alternate_color = hsla(0.1, 0.6, 0.3, 0.8);
             div().size_full().opacity(0.5).child(
                 canvas(
                     |_, _, _| (),
                     move |_, _, window, _| {
-                        for (glyph_id, origin) in [
-                            (GlyphId(1), point(px(5.13), px(10.245))),
-                            (GlyphId(2), point(px(10.0), px(15.0))),
-                            (GlyphId(3), point(px(15.0), px(20.0))),
-                        ] {
+                        for (index, glyph_id) in [GlyphId(1), GlyphId(2)].into_iter().enumerate() {
+                            let offset = px(index as f32 * 5.0);
+                            let mut origin = point(px(5.0) + offset, px(10.0) + offset);
+
+                            if index == 0 {
+                                origin += point(px(0.13), px(0.245));
+                            }
+
                             window
                                 .paint_glyph(origin, FontId(7), glyph_id, px(16.0), color)
                                 .unwrap();
+                        }
+
+                        let mut index = 0;
+
+                        for glyph_id in [GlyphId(3), GlyphId(5)] {
+                            for foreground in [color, alternate_color] {
+                                let offset = px(index as f32 * 5.0);
+                                let origin = point(px(15.0) + offset, px(20.0) + offset);
+
+                                window
+                                    .paint_emoji_with_color(
+                                        origin,
+                                        FontId(7),
+                                        glyph_id,
+                                        px(16.0),
+                                        foreground,
+                                    )
+                                    .unwrap();
+                                index += 1;
+                            }
                         }
                     },
                 )
@@ -8178,18 +8318,24 @@ mod tests {
 
     #[test]
     fn returned_raster_format_drives_atlas_and_scene_behavior() {
-        let mut app = TestApp::with_text_system(Arc::new(RasterFormatTextSystem));
+        let text_system = Arc::new(RasterFormatTextSystem::default());
+        let mut app = TestApp::with_text_system(text_system.clone());
         let mut test_window = app.open_window(|_, _| RasterFormatView);
         test_window.draw();
 
         test_window.update(|_, window, _| {
-            assert_eq!(window.rendered_primitive_counts(), (0, 1, 1, 1));
+            assert_eq!(window.rendered_primitive_counts(), (0, 1, 1, 4));
             let scene = &window.rendered_frame.scene;
             let expected_color = hsla(0.6, 0.7, 0.4, 0.8).opacity(0.5).into();
 
             assert_eq!(scene.monochrome_sprites[0].color, expected_color);
             assert_eq!(scene.subpixel_sprites[0].color, expected_color);
-            assert_eq!(scene.polychrome_sprites[0].opacity, 0.5);
+            assert!(
+                scene
+                    .polychrome_sprites
+                    .iter()
+                    .all(|sprite| sprite.opacity == 0.5)
+            );
             assert_eq!(
                 scene.monochrome_sprites[0].bounds.origin,
                 point(ScaledPixels(9.0), ScaledPixels(18.0))
@@ -8206,7 +8352,63 @@ mod tests {
                 scene.polychrome_sprites[0].tile.texture_id.kind,
                 crate::AtlasTextureKind::Polychrome
             );
+            let first_tile = scene.polychrome_sprites[0].tile;
+            let second_tile = scene.polychrome_sprites[1].tile;
+            let third_tile = scene.polychrome_sprites[2].tile;
+            let fourth_tile = scene.polychrome_sprites[3].tile;
+            assert_eq!(first_tile, second_tile);
+            assert_ne!(third_tile, fourth_tile);
         });
+
+        let rasterized = text_system.rasterized.lock().unwrap();
+        let color_styles = rasterized
+            .iter()
+            .filter(|params| params.raster_style.mode == GlyphRenderMode::Color)
+            .map(|params| params.raster_style.color_effect)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            color_styles,
+            [
+                RasterColorEffect::Preblend(crate::Rgba8::new(0, 0, 0, 204)),
+                RasterColorEffect::Preblend(crate::Rgba8::new(31, 88, 173, 204)),
+                RasterColorEffect::Preblend(crate::Rgba8::new(122, 86, 31, 204)),
+            ]
+        );
+    }
+
+    struct FragmentFailureView;
+
+    impl Render for FragmentFailureView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child("x😀")
+        }
+    }
+
+    #[test]
+    fn a_failed_glyph_does_not_hide_the_rest_of_its_fragment() {
+        let text_system = Arc::new(RasterFormatTextSystem {
+            rasterized: StdMutex::default(),
+            fail_next: AtomicBool::new(true),
+        });
+        let mut app = TestApp::with_text_system(text_system.clone());
+        let mut test_window = app.open_window(|_, _| FragmentFailureView);
+        test_window.draw();
+
+        test_window.update(|_, window, _| {
+            assert!(!window.rendered_frame.scene.subpixel_sprites.is_empty());
+        });
+
+        let glyph_ids = text_system
+            .rasterized
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|params| params.glyph_id)
+            .collect::<Vec<_>>();
+        assert!(
+            glyph_ids.starts_with(&[GlyphId(1), GlyphId(2)]),
+            "unexpected rasterization sequence: {glyph_ids:?}"
+        );
     }
 
     struct EmptyView;

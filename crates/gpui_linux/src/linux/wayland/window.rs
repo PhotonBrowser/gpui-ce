@@ -1900,6 +1900,11 @@ impl PlatformWindow for WaylandWindow {
         self.borrow_mut().input_handler.take()
     }
 
+    fn show_character_palette(&self) {
+        let client = self.borrow().client.clone();
+        client.show_character_palette(&self.0.surface());
+    }
+
     fn prompt(
         &self,
         _level: PromptLevel,
