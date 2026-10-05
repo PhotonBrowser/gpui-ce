@@ -85,6 +85,20 @@ fn ns_string(value: &str) -> Retained<NSString> {
     NSString::from_str(value)
 }
 
+fn add_mouse_tracking_area(native_view: ObjcId) {
+    unsafe {
+        let tracking_area: ObjcId = msg_send![class!(NSTrackingArea), alloc];
+        let _: () = msg_send![
+            tracking_area,
+            initWithRect: Objc2NSRect::new(Objc2NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+            options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect,
+            owner: native_view,
+            userInfo: NIL
+        ];
+        let _: () = msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
+    }
+}
+
 fn filenames_pboard_type() -> Retained<NSString> {
     ns_string("NSFilenamesPboardType")
 }
@@ -1359,6 +1373,9 @@ impl MacWindow {
                         native_window.setLevel_(NSNormalWindowLevel);
                     }
                     native_window.setAcceptsMouseMovedEvents_(Bool::new(true));
+                    // Request movement and exit callbacks directly on the GPUI view, so page
+                    // hover works independently of the window's first-responder event routing.
+                    add_mouse_tracking_area(native_view);
 
                     if let Some(tabbing_identifier) = tabbing_identifier {
                         let tabbing_id = ns_string(tabbing_identifier.as_str());
@@ -1373,16 +1390,7 @@ impl MacWindow {
                     // Use a tracking area to allow receiving MouseMoved events even when
                     // the window or application aren't active, which is often the case
                     // e.g. for notification windows.
-                    let tracking_area: ObjcId = msg_send![class!(NSTrackingArea), alloc];
-                    let _: () = msg_send![
-                        tracking_area,
-                        initWithRect: Objc2NSRect::new(Objc2NSPoint::new(0., 0.), NSSize::new(0., 0.)),
-                        options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect,
-                        owner: native_view,
-                        userInfo: NIL
-                    ];
-                    let _: () =
-                        msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
+                    add_mouse_tracking_area(native_view);
 
                     native_window.setLevel_(NSPopUpWindowLevel);
                     let _: () = msg_send![
