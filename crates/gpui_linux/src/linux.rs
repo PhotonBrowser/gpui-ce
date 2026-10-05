@@ -3,6 +3,7 @@ mod character_palette;
 mod dispatcher;
 mod headless;
 mod keyboard;
+mod mouse_tracking;
 mod platform;
 mod system_notifications;
 #[cfg(feature = "wayland")]

@@ -372,6 +372,7 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
         handle: AnyWindowHandle,
         options: WindowParams,
     ) -> anyhow::Result<Box<dyn PlatformWindow>> {
+        super::mouse_tracking::prepare_window();
         self.inner.open_window(handle, options)
     }
 
