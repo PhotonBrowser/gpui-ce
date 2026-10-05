@@ -12,25 +12,6 @@ use gpui::{
     WindowBounds, WindowOptions, div, font, hsla, prelude::*, px, relative, rgb, size,
 };
 
-const IBM_PLEX_REGULAR: &[u8] =
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-const IBM_PLEX_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf");
-const IBM_PLEX_SEMIBOLD: &[u8] =
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
-const IBM_PLEX_SEMIBOLD_ITALIC: &[u8] =
-    include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBoldItalic.ttf");
-const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
-const LILEX_BOLD: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Bold.ttf");
-const NOTO_SANS: &[u8] =
-    include_bytes!("../../../assets/fonts/noto-sans/NotoSans[wdth,wght].subset.ttf");
-const NOTO_SANS_ARABIC: &[u8] =
-    include_bytes!("../../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf");
-const NOTO_SANS_HEBREW: &[u8] =
-    include_bytes!("../../../assets/fonts/noto-sans-hebrew/NotoSansHebrew-Regular.ttf");
-const NOTO_COLOR_EMOJI: &[u8] =
-    include_bytes!("../../../assets/fonts/noto-color-emoji/NotoColorEmoji.subset.ttf");
-
 const BACKGROUND: u32 = 0x0d1117;
 const SURFACE: u32 = 0x161b22;
 const SAMPLE_SURFACE: u32 = 0x21262d;
@@ -44,16 +25,16 @@ struct TextSystemExample;
 fn register_fonts(cx: &App) {
     cx.text_system()
         .add_fonts(vec![
-            Cow::Borrowed(IBM_PLEX_REGULAR),
-            Cow::Borrowed(IBM_PLEX_ITALIC),
-            Cow::Borrowed(IBM_PLEX_SEMIBOLD),
-            Cow::Borrowed(IBM_PLEX_SEMIBOLD_ITALIC),
-            Cow::Borrowed(LILEX_REGULAR),
-            Cow::Borrowed(LILEX_BOLD),
-            Cow::Borrowed(NOTO_SANS),
-            Cow::Borrowed(NOTO_SANS_ARABIC),
-            Cow::Borrowed(NOTO_SANS_HEBREW),
-            Cow::Borrowed(NOTO_COLOR_EMOJI),
+            Cow::Borrowed(*gpui_fonts::IBM_PLEX),
+            Cow::Borrowed(*gpui_fonts::IBM_PLEX_ITALIC),
+            Cow::Borrowed(*gpui_fonts::IBM_PLEX_SEMIBOLD),
+            Cow::Borrowed(*gpui_fonts::IBM_PLEX_SEMIBOLD_ITALIC),
+            Cow::Borrowed(*gpui_fonts::LILEX),
+            Cow::Borrowed(*gpui_fonts::LILEX_BOLD),
+            Cow::Borrowed(*gpui_fonts::NOTO_SANS),
+            Cow::Borrowed(*gpui_fonts::NOTO_ARABIC),
+            Cow::Borrowed(*gpui_fonts::NOTO_HEBREW),
+            Cow::Borrowed(*gpui_fonts::NOTO_COLOR_EMOJI),
         ])
         .expect("failed to register the text system example fonts");
 }

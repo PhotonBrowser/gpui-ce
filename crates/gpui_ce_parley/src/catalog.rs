@@ -104,9 +104,7 @@ pub(crate) fn resolve_face(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font_fixtures::{
-        IBM_PLEX, IBM_PLEX_SEMIBOLD_ITALIC, LILEX, WIDTH_CONDENSED, WIDTH_REGULAR,
-    };
+    use gpui_fonts::{IBM_PLEX, IBM_PLEX_SEMIBOLD_ITALIC, LILEX, WIDTH_CONDENSED, WIDTH_REGULAR};
 
     #[test]
     fn registered_fonts_are_enumerated_and_resolved() {

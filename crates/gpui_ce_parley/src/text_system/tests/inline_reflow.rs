@@ -1,6 +1,6 @@
 use super::*;
-use crate::font_fixtures::NOTO_SANS;
 use gpui::FontWidth;
+use gpui_fonts::NOTO_SANS;
 
 const SCALE_FACTOR: f32 = 1.5;
 

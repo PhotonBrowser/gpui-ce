@@ -360,10 +360,6 @@ mod tests {
     use super::*;
     use usvg::fontdb::{Database, Family, Query};
 
-    const IBM_PLEX_REGULAR: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const LILEX_REGULAR: &[u8] = include_bytes!("../../../assets/fonts/lilex/Lilex-Regular.ttf");
-
     #[test]
     fn renders_parsed_svg_at_requested_size() -> Result<()> {
         let renderer = SvgRenderer::new(Arc::new(AssetRegistry::default()));
@@ -394,16 +390,16 @@ mod tests {
 
     fn db_with_bundled_fonts() -> Database {
         let mut db = Database::new();
-        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-        db.load_font_data(LILEX_REGULAR.to_vec());
+        db.load_font_data(gpui_fonts::IBM_PLEX.to_vec());
+        db.load_font_data(gpui_fonts::LILEX.to_vec());
         db
     }
 
     #[test]
     fn text_with_split_glyph_clusters_in_mixed_fonts_does_not_panic() {
         let mut db = Database::new();
-        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-        db.load_font_data(LILEX_REGULAR.to_vec());
+        db.load_font_data(gpui_fonts::IBM_PLEX.to_vec());
+        db.load_font_data(gpui_fonts::LILEX.to_vec());
         let options = usvg::Options {
             fontdb: std::sync::Arc::new(db),
             ..Default::default()
