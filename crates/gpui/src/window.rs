@@ -1,24 +1,3 @@
-#[cfg(test)]
-use crate::{
-    DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, Font, FontMetrics,
-    InlineLayout, InlineLayoutRequest, InputEvent, InteractiveElement, LineLayout, LongPressEvent,
-    MouseDownEvent, ParentElement, PlatformTextSystem, RasterizedGlyph, RequestFrameOptions,
-    StatefulInteractiveElement, Styled, TestApp, TestAppContext, TestTextSystem, TextLayoutRequest,
-    TouchDragEvent, TouchId, TouchPhase, canvas, div, hsla,
-};
-
-#[cfg(test)]
-use proptest::prelude::*;
-
-#[cfg(test)]
-use std::path::PathBuf;
-
-#[cfg(feature = "profiler")]
-use crate::DebugFrameOverlayMode;
-#[cfg(any(feature = "inspector", debug_assertions))]
-use crate::Inspector;
-#[cfg(feature = "profiler")]
-use crate::profiler;
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
@@ -39,11 +18,16 @@ use crate::{
     TextStyleRefinement, ThermalState, TransformationMatrix, Transition, TransitionState,
     Underline, UnderlineStyle, UnicodeBidi, WindowAppearance, WindowBackgroundAppearance,
     WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    point, px, rems, size, transparent_black, white,
+    gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer},
+    interactive::TouchEvent,
+    point, px, rems, size, transparent_black,
+    util::{
+        atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel,
+        round_half_toward_zero, round_half_toward_zero_f64, round_stroke_to_device_pixel,
+        round_to_device_pixel,
+    },
+    white,
 };
-
-use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
-use crate::interactive::TouchEvent;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{FxHashMap, FxHashSet};
 use derive_more::{Deref, DerefMut};
@@ -60,12 +44,12 @@ use refineable::Refineable;
 use scheduler::Instant;
 use slotmap::SlotMap;
 use smallvec::SmallVec;
-use std::collections::HashMap;
 use std::{
     any::{Any, TypeId},
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
+    collections::HashMap,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -80,18 +64,20 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(not(target_family = "wasm"))]
+use self::a11y::ROOT_NODE_ID;
+#[cfg(feature = "profiler")]
+use crate::DebugFrameOverlayMode;
+#[cfg(any(feature = "inspector", debug_assertions))]
+use crate::Inspector;
+#[cfg(feature = "profiler")]
+use crate::profiler;
+
 pub(crate) mod a11y;
 mod prompts;
 
+use a11y::A11y;
 pub use a11y::A11ySubtreeBuilder;
-
-use self::a11y::A11y;
-#[cfg(not(target_family = "wasm"))]
-use self::a11y::ROOT_NODE_ID;
-use crate::util::{
-    atomic_incr_if_not_zero, ceil_to_device_pixel, floor_to_device_pixel, round_half_toward_zero,
-    round_half_toward_zero_f64, round_stroke_to_device_pixel, round_to_device_pixel,
-};
 pub use prompts::*;
 
 fn quantize_glyph_origin(origin: Point<ScaledPixels>) -> (Point<ScaledPixels>, Point<u8>) {
@@ -8062,12 +8048,18 @@ pub fn outline(
 mod tests {
     use super::*;
     use crate::{
-        FocusHandle, ImageSource, PreparedRasterStyle, RasterColorEffect, RasterStyleRequest,
-        ShaderBool, img, linear_color_stop, linear_gradient,
+        DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Font,
+        FontMetrics, ImageSource, InlineLayout, InlineLayoutRequest, InputEvent,
+        InteractiveElement, LineLayout, LongPressEvent, MouseDownEvent, ParentElement,
+        PlatformTextSystem, PreparedRasterStyle, RasterColorEffect, RasterStyleRequest,
+        RasterizedGlyph, RequestFrameOptions, ShaderBool, StatefulInteractiveElement, Styled,
+        TestApp, TestAppContext, TestTextSystem, TextLayoutRequest, TouchDragEvent, TouchId,
+        TouchPhase, canvas, div, hsla, img, linear_color_stop, linear_gradient,
     };
     use image::{Frame as ImageFrame, ImageBuffer, Rgba};
+    use proptest::prelude::*;
     use smallvec::smallvec;
-    use std::sync::Mutex as StdMutex;
+    use std::{path::PathBuf, sync::Mutex as StdMutex};
 
     #[test]
     fn hit_test_preserves_inline_regions_occlusion_and_metadata() {

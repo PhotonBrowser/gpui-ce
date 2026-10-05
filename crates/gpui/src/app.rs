@@ -1,4 +1,34 @@
+use crate::{
+    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
+    ArenaBox, Asset, AssetRegistry, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError,
+    CursorStyle, DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle,
+    FocusMap, ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap,
+    Keystroke, LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform,
+    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority,
+    PromptBuilder, PromptButton, PromptHandle, PromptLevel, Render, RenderImage,
+    RenderablePromptHandle, Reservation, ScreenCaptureSource, SharedString, SubscriberSet,
+    Subscription, SvgRenderer, SystemNotification, SystemNotificationResponse, Task,
+    TextRenderingMode, TextSystem, ThermalState, Window, WindowAppearance, WindowButtonLayout,
+    WindowHandle, WindowId, WindowInvalidator,
+    colors::{Colors, GlobalColors},
+    hash,
+    http_client::{HttpClient, NullHttpClient},
+    init_app_menus,
+};
+use anyhow::{Context as _, Result, anyhow};
+use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
+use derive_more::{Deref, DerefMut};
+use futures::{
+    Future, FutureExt,
+    channel::oneshot,
+    future::{LocalBoxFuture, Shared},
+};
+use gpui_util::{ResultExt, debug_panic};
+use itertools::Itertools;
+use parking_lot::RwLock;
 use scheduler::Instant;
+use slotmap::SlotMap;
+use smallvec::SmallVec;
 use std::{
     any::{TypeId, type_name},
     cell::{BorrowMutError, Cell, Ref, RefCell, RefMut},
@@ -10,58 +40,6 @@ use std::{
     rc::{Rc, Weak},
     sync::{Arc, atomic::Ordering::SeqCst},
     time::Duration,
-};
-
-use anyhow::{Context as _, Result, anyhow};
-use derive_more::{Deref, DerefMut};
-use futures::{
-    Future, FutureExt,
-    channel::oneshot,
-    future::{LocalBoxFuture, Shared},
-};
-use itertools::Itertools;
-use parking_lot::RwLock;
-use slotmap::SlotMap;
-
-use crate::{
-    AssetRegistry,
-    http_client::{HttpClient, NullHttpClient},
-};
-pub use async_context::*;
-#[cfg(feature = "bench-support")]
-pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
-use collections::{FxHashMap, FxHashSet, HashMap, TypeIdHashMap, TypeIdHashSet, VecDeque};
-pub use context::*;
-pub use entity_map::*;
-use gpui_util::{ResultExt, debug_panic};
-#[cfg(any(test, feature = "test-support"))]
-pub use headless_app_context::*;
-use smallvec::SmallVec;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_app::*;
-#[cfg(any(test, feature = "test-support"))]
-pub use test_context::*;
-#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
-pub use visual_test_context::*;
-
-#[cfg(any(feature = "inspector", debug_assertions))]
-use crate::InspectorElementRegistry;
-#[cfg(target_os = "macos")]
-use crate::MacActivationPolicy;
-use crate::{
-    Action, ActionBuildError, ActionRegistry, Any, AnyView, AnyWindowHandle, AppContext, Arena,
-    ArenaBox, Asset, BackgroundExecutor, Bounds, ClipboardItem, ClipboardReadError, CursorStyle,
-    DispatchPhase, DisplayId, EventEmitter, ExternalDragPayload, FocusHandle, FocusMap,
-    ForegroundExecutor, Global, HapticFeedbackStyle, KeyBinding, KeyContext, Keymap, Keystroke,
-    LayoutId, Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay,
-    PlatformKeyboardLayout, PlatformKeyboardMapper, Point, Priority, PromptBuilder, PromptButton,
-    PromptHandle, PromptLevel, Render, RenderImage, RenderablePromptHandle, Reservation,
-    ScreenCaptureSource, SharedString, SubscriberSet, Subscription, SvgRenderer,
-    SystemNotification, SystemNotificationResponse, Task, TextRenderingMode, TextSystem,
-    ThermalState, Window, WindowAppearance, WindowButtonLayout, WindowHandle, WindowId,
-    WindowInvalidator,
-    colors::{Colors, GlobalColors},
-    hash, init_app_menus,
 };
 
 mod async_context;
@@ -77,6 +55,25 @@ mod test_app;
 mod test_context;
 #[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
 mod visual_test_context;
+
+pub use async_context::*;
+#[cfg(feature = "bench-support")]
+pub use bench_context::{BenchAppContext, BenchReport, BenchWindowContext, bench_platform};
+pub use context::*;
+pub use entity_map::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use headless_app_context::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_app::*;
+#[cfg(any(test, feature = "test-support"))]
+pub use test_context::*;
+#[cfg(all(target_os = "macos", any(test, feature = "test-support")))]
+pub use visual_test_context::*;
+
+#[cfg(any(feature = "inspector", debug_assertions))]
+use crate::InspectorElementRegistry;
+#[cfg(target_os = "macos")]
+use crate::MacActivationPolicy;
 
 /// The duration for which native applications wait for futures returned from
 /// [Context::on_app_quit] before fully quitting.
