@@ -951,31 +951,21 @@ fn read_color_bitmap(bitmap: &IWICBitmap, width: i32, height: i32, alpha: u8) ->
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use super::*;
     use gpui::{
         FontStyle, FontWeight, FontWidth, ForegroundDependency, Point, RasterizedGlyphFormat, Rgba,
         font, px, rgba,
     };
     use gpui_parley::FontSynthesis;
-
-    const IBM_PLEX: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-    const IBM_PLEX_ITALIC: &[u8] =
-        include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf");
-    const SOURCE_SERIF: &[u8] =
-        include_bytes!("../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf");
-    const NOTO_SANS: &[u8] =
-        include_bytes!("../../../assets/fonts/noto-sans/NotoSans[wdth,wght].subset.ttf");
+    use std::collections::BTreeMap;
 
     #[test]
     fn fixed_fonts_cover_native_modes_instances_and_empty_glyphs() -> Result<()> {
         let system = DirectWriteTextSystem::new_headless()?;
         system.add_fonts(vec![
-            Cow::Borrowed(IBM_PLEX),
-            Cow::Borrowed(SOURCE_SERIF),
-            Cow::Borrowed(NOTO_SANS),
+            Cow::Borrowed(*gpui_fonts::IBM_PLEX),
+            Cow::Borrowed(*gpui_fonts::SOURCE_SERIF),
+            Cow::Borrowed(*gpui_fonts::NOTO_SANS),
         ])?;
 
         let regular_id = system.font_id(&font("IBM Plex Sans"))?;
@@ -1101,7 +1091,11 @@ mod tests {
 
     #[test]
     fn direct_write_loads_a_nonzero_collection_face() -> Result<()> {
-        let collection = test_collection(&[SOURCE_SERIF, IBM_PLEX, IBM_PLEX_ITALIC]);
+        let collection = test_collection(&[
+            *gpui_fonts::SOURCE_SERIF,
+            *gpui_fonts::IBM_PLEX,
+            *gpui_fonts::IBM_PLEX_ITALIC,
+        ]);
         let source = FontDataBlob::from(collection);
         let mut renderer = DirectWriteGlyphRenderer::new(None)?;
         renderer.load_face(RasterFace {
@@ -1345,7 +1339,7 @@ mod tests {
     #[test]
     fn color_fallback_bakes_foreground_and_bitmap_fonts_keep_portable_routing() -> Result<()> {
         let system = DirectWriteTextSystem::new_headless()?;
-        system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
+        system.add_fonts(vec![Cow::Borrowed(*gpui_fonts::IBM_PLEX)])?;
         let font_id = system.font_id(&font("IBM Plex Sans"))?;
         let glyph_id = system.glyph_for_char(font_id, 'A').unwrap();
 
@@ -1374,9 +1368,7 @@ mod tests {
         }
 
         let bitmap_system = DirectWriteTextSystem::new_headless()?;
-        bitmap_system.add_fonts(vec![Cow::Borrowed(include_bytes!(
-            "../../../assets/fonts/noto-color-emoji/NotoColorEmoji.subset.ttf"
-        ))])?;
+        bitmap_system.add_fonts(vec![Cow::Borrowed(*gpui_fonts::NOTO_COLOR_EMOJI)])?;
         let font_id = bitmap_system.font_id(&font("Noto Color Emoji"))?;
         let glyph_id = bitmap_system.glyph_for_char(font_id, '😀').unwrap();
         let params = color_params(
@@ -1663,7 +1655,7 @@ mod tests {
 
     fn color_test_system() -> Result<(DirectWriteTextSystem, FontId)> {
         let outline_system = DirectWriteTextSystem::new_headless()?;
-        outline_system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)])?;
+        outline_system.add_fonts(vec![Cow::Borrowed(*gpui_fonts::IBM_PLEX)])?;
         let font_id = outline_system.font_id(&font("IBM Plex Sans"))?;
         let mut glyphs = [0; 6];
 
@@ -1722,15 +1714,15 @@ mod tests {
         let cpal = vec![
             0, 0, 0, 2, 0, 1, 0, 2, 0, 0, 0, 14, 0, 0, 0, 0, 255, 255, 255, 0, 0, 128,
         ];
-        let table_count = read_u16(IBM_PLEX, 4).unwrap() as usize;
+        let table_count = read_u16(*gpui_fonts::IBM_PLEX, 4).unwrap() as usize;
         let mut tables = BTreeMap::new();
 
         for table_index in 0..table_count {
             let record = 12 + table_index * 16;
-            let tag: [u8; 4] = IBM_PLEX[record..record + 4].try_into().unwrap();
-            let offset = read_u32(IBM_PLEX, record + 8).unwrap() as usize;
-            let length = read_u32(IBM_PLEX, record + 12).unwrap() as usize;
-            tables.insert(tag, IBM_PLEX[offset..offset + length].to_vec());
+            let tag: [u8; 4] = gpui_fonts::IBM_PLEX[record..record + 4].try_into().unwrap();
+            let offset = read_u32(*gpui_fonts::IBM_PLEX, record + 8).unwrap() as usize;
+            let length = read_u32(*gpui_fonts::IBM_PLEX, record + 12).unwrap() as usize;
+            tables.insert(tag, gpui_fonts::IBM_PLEX[offset..offset + length].to_vec());
         }
 
         tables.insert(*b"COLR", colr);
@@ -1740,7 +1732,7 @@ mod tests {
         let table_count = tables.len() as u16;
         let search_range = (1u16 << table_count.ilog2()) * 16;
         let mut font = vec![0; 12 + tables.len() * 16];
-        font[..4].copy_from_slice(&IBM_PLEX[..4]);
+        font[..4].copy_from_slice(&gpui_fonts::IBM_PLEX[..4]);
         font[4..6].copy_from_slice(&table_count.to_be_bytes());
         font[6..8].copy_from_slice(&search_range.to_be_bytes());
         font[8..10].copy_from_slice(&(table_count.ilog2() as u16).to_be_bytes());

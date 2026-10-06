@@ -15,3 +15,4 @@ gpui = { path = "../../../gpui", package = "gpui-ce" }
 gpui_platform = { path = "../../../gpui_platform" }
 web-sys = { version = "0.3", features = ["console", "Location", "Window"] }
 web-time = "1"
+gpui_fonts = { path = "../../../gpui_ce_fonts", version = "0.2.2", package = "gpui-ce-fonts" }

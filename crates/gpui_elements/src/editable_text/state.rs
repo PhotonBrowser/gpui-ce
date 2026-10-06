@@ -1600,12 +1600,8 @@ mod tests {
         );
         backend
             .add_fonts(vec![
-                Cow::Borrowed(include_bytes!(
-                    "../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
-                )),
-                Cow::Borrowed(include_bytes!(
-                    "../../../../assets/fonts/noto-color-emoji/NotoColorEmoji.subset.ttf"
-                )),
+                Cow::Borrowed(*gpui_fonts::IBM_PLEX),
+                Cow::Borrowed(*gpui_fonts::NOTO_COLOR_EMOJI),
             ])
             .unwrap();
         let text_system = WindowTextSystem::new(Arc::new(TextSystem::new(backend)));

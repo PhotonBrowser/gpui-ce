@@ -10,11 +10,7 @@ use gpui::{
 };
 use std::borrow::Cow;
 
-#[allow(dead_code)]
-#[path = "../../gpui_ce_parley/src/font_fixtures.rs"]
-mod font_fixtures;
-
-use font_fixtures::{IBM_PLEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, SOURCE_SERIF};
+use gpui_fonts::{IBM_PLEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, SOURCE_SERIF};
 
 const BIDI_SAMPLE: &str =
     "שלום עולם\nمرحبا بالعالم\nabc אבג def\nx (مرحبا) y\nEnglish ثم عربي ثم English";

@@ -2477,10 +2477,6 @@ impl PlatformTextSystem for ParleyTextSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font_fixtures::{
-        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, NOTO_SANS,
-        SOURCE_SERIF,
-    };
     use crate::{FontSynthesis, FontVariation, RasterFace};
     use gpui::{
         AppContext, CaretSelection, Context, FontFallbacks, FontFeatures as GpuiFontFeatures,
@@ -2488,6 +2484,10 @@ mod tests {
         HeadlessAppContext, HighlightStyle, Hsla, IntoElement, Point, RasterizedGlyphFormat,
         Render, ScaledPixels, StrikethroughStyle, Styled, StyledText, TextSystem, UnderlineStyle,
         VerticalAlign, Window, WindowHandle, WindowTextSystem, div, font, hsla, prelude::*,
+    };
+    use gpui_fonts::{
+        IBM_PLEX, IBM_PLEX_SEMIBOLD, LILEX, NOTO_ARABIC, NOTO_COLOR_EMOJI, NOTO_HEBREW, NOTO_SANS,
+        SOURCE_SERIF,
     };
     use std::{
         cell::Cell,

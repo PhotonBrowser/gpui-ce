@@ -765,18 +765,13 @@ mod renderer {
         use super::*;
         use gpui::FontWidth;
 
-        const IBM_PLEX: &[u8] =
-            include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-        const IBM_PLEX_ITALIC: &[u8] =
-            include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Italic.ttf");
-        const SOURCE_SERIF: &[u8] =
-            include_bytes!("../../../assets/fonts/source-serif-4/SourceSerif4[opsz,wght].ttf");
-        const NOTO_SANS: &[u8] =
-            include_bytes!("../../../assets/fonts/noto-sans/NotoSans[wdth,wght].subset.ttf");
-
         #[test]
         fn collection_faces_are_selected_and_compacted_by_physical_index() {
-            let collection = test_collection(&[SOURCE_SERIF, IBM_PLEX, IBM_PLEX_ITALIC]);
+            let collection = test_collection(&[
+                *gpui_fonts::SOURCE_SERIF,
+                *gpui_fonts::IBM_PLEX,
+                *gpui_fonts::IBM_PLEX_ITALIC,
+            ]);
             let collection_source = FontDataBlob::from(collection.clone());
             let source = source_from_blob(collection_source.clone());
             let descriptor = collection_descriptor(&source.data, &collection, 1).unwrap();
@@ -889,7 +884,10 @@ mod renderer {
                 MacGlyphRenderer::new(),
             );
             system
-                .add_fonts(vec![Cow::Borrowed(SOURCE_SERIF), Cow::Borrowed(NOTO_SANS)])
+                .add_fonts(vec![
+                    Cow::Borrowed(*gpui_fonts::SOURCE_SERIF),
+                    Cow::Borrowed(*gpui_fonts::NOTO_SANS),
+                ])
                 .unwrap();
             let render_pass = |descriptor: &gpui::Font| {
                 let font_id = system.font_id(descriptor).unwrap();
@@ -955,7 +953,7 @@ mod renderer {
 
         #[test]
         fn core_text_preserves_default_and_nondefault_optical_sizes() {
-            let source = FontDataBlob::from(SOURCE_SERIF.to_vec());
+            let source = FontDataBlob::from(gpui_fonts::SOURCE_SERIF.to_vec());
             let source_data = source_from_blob(source.clone());
             let default_variations = [
                 FontVariation::new(*b"opsz", 20.0),
@@ -1013,7 +1011,9 @@ mod renderer {
                 MacGlyphRenderer::new(),
             )
             .with_automatic_optical_sizing();
-            system.add_fonts(vec![Cow::Borrowed(SOURCE_SERIF)]).unwrap();
+            system
+                .add_fonts(vec![Cow::Borrowed(*gpui_fonts::SOURCE_SERIF)])
+                .unwrap();
 
             let shaped_glyph = |font_size| {
                 let layout = system.layout_text(TextLayoutRequest {
@@ -1064,7 +1064,7 @@ mod renderer {
 
         #[test]
         fn explicit_optical_outlines_match_core_texts_automatic_reference() {
-            let source = FontDataBlob::from(SOURCE_SERIF.to_vec());
+            let source = FontDataBlob::from(gpui_fonts::SOURCE_SERIF.to_vec());
             let source_data = source_from_blob(source.clone());
             let descriptor =
                 core_text::font_manager::create_font_descriptor_with_data(source_data.data.clone())
@@ -1192,7 +1192,9 @@ mod renderer {
                 "IBM Plex Sans",
                 MacGlyphRenderer::new(),
             );
-            system.add_fonts(vec![Cow::Borrowed(IBM_PLEX)]).unwrap();
+            system
+                .add_fonts(vec![Cow::Borrowed(*gpui_fonts::IBM_PLEX)])
+                .unwrap();
             let font_id = system.font_id(&gpui_font("IBM Plex Sans").bold()).unwrap();
             let glyph_id = system.glyph_for_char(font_id, 'A').unwrap();
             let raster = system
@@ -1268,7 +1270,9 @@ mod renderer {
                 "Source Serif 4",
                 MacGlyphRenderer::new(),
             );
-            system.add_fonts(vec![Cow::Borrowed(SOURCE_SERIF)]).unwrap();
+            system
+                .add_fonts(vec![Cow::Borrowed(*gpui_fonts::SOURCE_SERIF)])
+                .unwrap();
             let font_id = system
                 .font_id(&gpui_font("Source Serif 4").bold().italic())
                 .unwrap();

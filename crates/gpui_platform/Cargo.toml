@@ -40,6 +40,9 @@ x11 = ["gpui_linux/x11"]
 [dependencies]
 gpui.workspace = true
 
+[dev-dependencies]
+gpui_fonts = { path = "../gpui_ce_fonts", version = "0.2.2", package = "gpui-ce-fonts" }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui_apple.workspace = true
 gpui_macos.workspace = true

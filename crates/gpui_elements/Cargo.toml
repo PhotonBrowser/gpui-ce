@@ -22,6 +22,7 @@ smallvec.workspace = true
 gpui_parley.workspace = true
 gpui = { path = "../gpui", package = "gpui-ce", features = ["test-support"] }
 gpui_platform = { workspace = true, features = ["wayland", "x11"] }
+gpui_fonts = { path = "../gpui_ce_fonts", version = "0.2.2", package = "gpui-ce-fonts" }
 
 [[example]]
 name = "editable_text"

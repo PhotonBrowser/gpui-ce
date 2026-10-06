@@ -930,8 +930,8 @@ fn convert_subpixel_mask_to_bgra(pixels: &mut [u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::font_fixtures::{NOTO_COLOR_EMOJI, SOURCE_SERIF};
     use gpui::{RasterColorEffect, Rgba8, point, px, rgba};
+    use gpui_fonts::{NOTO_COLOR_EMOJI, SOURCE_SERIF};
 
     #[derive(Default)]
     struct RecordingNativeRasterizer {

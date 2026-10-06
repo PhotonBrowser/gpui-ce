@@ -1,11 +1,6 @@
 //! Shared text support built on the Parley text stack.
 
 mod catalog;
-#[cfg(test)]
-mod font_fixtures {
-    include!("font_fixtures.rs");
-    include!("font_fixtures_tests.rs");
-}
 mod store;
 mod text_system;
 
