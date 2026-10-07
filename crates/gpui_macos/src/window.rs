@@ -88,7 +88,7 @@ fn ns_string(value: &str) -> Retained<NSString> {
 fn add_mouse_tracking_area(native_view: ObjcId) {
     unsafe {
         let tracking_area: ObjcId = msg_send![class!(NSTrackingArea), alloc];
-        let _: () = msg_send![
+        let tracking_area: ObjcId = msg_send![
             tracking_area,
             initWithRect: Objc2NSRect::new(Objc2NSPoint::new(0., 0.), NSSize::new(0., 0.)),
             options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect,
