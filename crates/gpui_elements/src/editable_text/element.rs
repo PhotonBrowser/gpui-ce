@@ -1007,15 +1007,9 @@ mod tests {
                 .with_fallback_families(["IBM Plex Sans", "Noto Sans Hebrew", "Noto Sans Arabic"]);
             system
                 .add_fonts(vec![
-                    Cow::Borrowed(include_bytes!(
-                        "../../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"
-                    )),
-                    Cow::Borrowed(include_bytes!(
-                        "../../../../assets/fonts/noto-sans-hebrew/NotoSansHebrew-Regular.ttf"
-                    )),
-                    Cow::Borrowed(include_bytes!(
-                        "../../../../assets/fonts/noto-sans-arabic/NotoSansArabic-Regular.ttf"
-                    )),
+                    Cow::Borrowed(*gpui_fonts::IBM_PLEX),
+                    Cow::Borrowed(*gpui_fonts::NOTO_HEBREW),
+                    Cow::Borrowed(*gpui_fonts::NOTO_ARABIC),
                 ])
                 .unwrap();
 

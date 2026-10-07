@@ -4,14 +4,9 @@ use gpui::{
     TextAlign, TextLayoutOptions, TextLayoutRequest, TextRun, TextSystem, font, px,
 };
 use gpui_ce_parley::{ParleyTextSystem, SystemFonts};
+use gpui_fonts::{IBM_PLEX, LILEX, SOURCE_SERIF};
 use std::borrow::Cow;
 use std::sync::Arc;
-
-#[allow(dead_code)]
-#[path = "../src/font_fixtures.rs"]
-mod font_fixtures;
-
-use font_fixtures::{IBM_PLEX, LILEX, SOURCE_SERIF};
 
 fn text_system() -> (ParleyTextSystem, TextRun) {
     let system = ParleyTextSystem::new_with_system_font(SystemFonts::Skip, IBM_PLEX.family);

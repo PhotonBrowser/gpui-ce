@@ -2439,6 +2439,7 @@ dependencies = [
  "futures",
  "futures-concurrency",
  "getrandom 0.3.4",
+ "gpui-ce-fonts",
  "gpui_ce_collections",
  "gpui_ce_elements",
  "gpui_ce_macros",
@@ -2506,6 +2507,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui-ce-fonts"
+version = "0.2.2"
+
+[[package]]
 name = "gpui_ce_apple"
 version = "0.1.0"
 dependencies = [
@@ -2553,6 +2558,7 @@ name = "gpui_ce_elements"
 version = "0.1.0"
 dependencies = [
  "gpui-ce",
+ "gpui-ce-fonts",
  "gpui_ce_parley",
  "gpui_ce_platform",
  "palette",
@@ -2628,6 +2634,7 @@ dependencies = [
  "foreign-types",
  "futures",
  "gpui-ce",
+ "gpui-ce-fonts",
  "gpui_ce_apple",
  "gpui_ce_collections",
  "gpui_ce_media",
@@ -2691,6 +2698,7 @@ dependencies = [
  "criterion",
  "fontique",
  "gpui-ce",
+ "gpui-ce-fonts",
  "gpui_ce_collections",
  "parking_lot",
  "parley",
@@ -2716,6 +2724,7 @@ version = "0.1.0"
 dependencies = [
  "console_error_panic_hook",
  "gpui-ce",
+ "gpui-ce-fonts",
  "gpui_ce_apple",
  "gpui_ce_linux",
  "gpui_ce_macos",
@@ -2872,6 +2881,7 @@ dependencies = [
  "etagere",
  "futures",
  "gpui-ce",
+ "gpui-ce-fonts",
  "gpui_ce_collections",
  "gpui_ce_parley",
  "gpui_ce_render",

@@ -28,6 +28,7 @@ unicode-segmentation.workspace = true
 collections.workspace = true
 criterion.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
+gpui_fonts = { path = "../gpui_ce_fonts", version = "0.2.2", package = "gpui-ce-fonts" }
 
 [[bench]]
 name = "text_pipeline"

@@ -14,6 +14,7 @@ members = [
   "./crates/gpui_platform/",
   "./crates/gpui_shared_string/",
   "./crates/gpui_elements/",
+  "./crates/gpui_ce_fonts/",
   "./crates/gpui_collections/",
   "./crates/gpui_refineable/",
   "./crates/gpui_derive_refineable/",
