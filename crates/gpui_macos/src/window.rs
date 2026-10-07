@@ -1976,6 +1976,12 @@ impl PlatformWindow for MacWindow {
                     native_window.setContentView_(backdrop_root);
                     self.0.lock().backdrop_root = Some(backdrop_root.autorelease());
                 }
+                // Removing the view from its superview resigns its first-responder
+                // status, after which AppKit stops delivering text input to it.
+                let first_responder: ObjcId = msg_send![native_window, firstResponder];
+                if first_responder.is_null() || first_responder == native_window {
+                    native_window.makeFirstResponder_(native_view);
+                }
             }
         }
     }
