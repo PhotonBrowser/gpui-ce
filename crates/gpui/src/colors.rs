@@ -1,7 +1,13 @@
-use crate::{App, Global, Window, WindowAppearance, rgb};
+use crate::{App, ColorExt, Global, Window, WindowAppearance, rgb};
 use palette::rgb::Rgba;
 use std::ops::Deref;
 use std::sync::Arc;
+
+const SELECTED_COLOR_OPACITY: f32 = 0.2;
+
+fn selected_color(text: Rgba, background: Rgba) -> Rgba {
+    text.opacity(SELECTED_COLOR_OPACITY).blend(&background)
+}
 
 /// The default set of colors for gpui.
 ///
@@ -43,12 +49,14 @@ impl Colors {
 
     /// Returns the default dark colors.
     pub fn dark() -> Self {
+        let text = rgb(0xffffff);
+        let background = rgb(0x222222);
         Self {
-            text: rgb(0xffffff),
+            text,
             selected_text: rgb(0xffffff),
             disabled: rgb(0x565656),
-            selected: rgb(0x2457ca),
-            background: rgb(0x222222),
+            selected: selected_color(text, background),
+            background,
             border: rgb(0x000000),
             separator: rgb(0xd9d9d9),
             container: rgb(0x262626),
@@ -57,12 +65,14 @@ impl Colors {
 
     /// Returns the default light colors.
     pub fn light() -> Self {
+        let text = rgb(0x252525);
+        let background = rgb(0xffffff);
         Self {
-            text: rgb(0x252525),
+            text,
             selected_text: rgb(0xffffff),
-            background: rgb(0xffffff),
+            background,
             disabled: rgb(0xb0b0b0),
-            selected: rgb(0x2a63d9),
+            selected: selected_color(text, background),
             border: rgb(0xd9d9d9),
             separator: rgb(0xe6e6e6),
             container: rgb(0xf4f5f5),
