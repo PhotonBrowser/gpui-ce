@@ -1,12 +1,21 @@
-use crate::{App, ColorExt, Global, Window, WindowAppearance, rgb};
+use crate::{App, Global, Window, WindowAppearance, rgb};
 use palette::rgb::Rgba;
 use std::ops::Deref;
 use std::sync::Arc;
 
-const SELECTED_COLOR_OPACITY: f32 = 0.2;
+const SELECTED_TEXT_WEIGHT: f32 = 0.37;
 
 fn selected_color(text: Rgba, background: Rgba) -> Rgba {
-    text.opacity(SELECTED_COLOR_OPACITY).blend(&background)
+    let mix_channel = |text: f32, background: f32| {
+        text * SELECTED_TEXT_WEIGHT + background * (1.0 - SELECTED_TEXT_WEIGHT)
+    };
+
+    Rgba::new(
+        mix_channel(text.color.red, background.color.red),
+        mix_channel(text.color.green, background.color.green),
+        mix_channel(text.color.blue, background.color.blue),
+        1.0,
+    )
 }
 
 /// The default set of colors for gpui.
@@ -53,7 +62,7 @@ impl Colors {
         let background = rgb(0x222222);
         Self {
             text,
-            selected_text: rgb(0xffffff),
+            selected_text: text,
             disabled: rgb(0x565656),
             selected: selected_color(text, background),
             background,
@@ -69,7 +78,7 @@ impl Colors {
         let background = rgb(0xffffff);
         Self {
             text,
-            selected_text: rgb(0xffffff),
+            selected_text: text,
             background,
             disabled: rgb(0xb0b0b0),
             selected: selected_color(text, background),
