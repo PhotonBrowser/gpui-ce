@@ -527,6 +527,11 @@ impl Element for EditableTextElement {
             }
 
             // Actually draw the elements we constructed during prepaint
+            // Keep the selection behind the glyphs so selected text stays legible.
+            for quad in prepaint.elements.selection.drain(..) {
+                window.paint_quad(quad);
+            }
+
             if let Some(document) = prepaint.elements.document.take() {
                 let _ = document.paint(
                     prepaint.interactivity.document_origin(),
@@ -539,10 +544,6 @@ impl Element for EditableTextElement {
             }
 
             for quad in prepaint.elements.ime_marked.drain(..) {
-                window.paint_quad(quad);
-            }
-
-            for quad in prepaint.elements.selection.drain(..) {
                 window.paint_quad(quad);
             }
 
