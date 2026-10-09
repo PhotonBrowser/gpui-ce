@@ -57,6 +57,9 @@ const SIZES_SLOT: u64 = 3;
 const PRIMARY_TEXTURE_SLOT: u64 = 0;
 const SECONDARY_TEXTURE_SLOT: u64 = 1;
 const SAMPLER_SLOT: u64 = 0;
+/// Frames an imported external surface may go undrawn before its texture is
+/// released. Producers rotate a few backings, all drawn far more often.
+const EXTERNAL_SURFACE_IDLE_FRAMES: u64 = 120;
 
 pub type Context = Arc<Mutex<InstanceBufferPool>>;
 pub type Renderer = MetalRenderer;
@@ -266,10 +269,13 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    /// Imported external surfaces, with the frame each was last drawn in.
     external_surface_textures: std::collections::HashMap<
         ExternalTextureIdentity,
-        core_video::metal_texture::CVMetalTexture,
+        (core_video::metal_texture::CVMetalTexture, u64),
     >,
+    /// Counts frames encoded, to age out external surfaces no longer drawn.
+    external_surface_frame: u64,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
@@ -536,6 +542,7 @@ impl MetalRenderer {
             sprite_atlas,
             core_video_texture_cache,
             external_surface_textures: std::collections::HashMap::new(),
+            external_surface_frame: 0,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             scene_color_texture: None,
@@ -922,6 +929,20 @@ impl MetalRenderer {
         self.draw_primitives_to_texture(scene, instance_buffer, drawable.texture(), viewport_size)
     }
 
+    /// Releases external surface textures that recent frames have not drawn,
+    /// so a producer's replaced backings do not stay resident. A command
+    /// buffer still sampling one keeps its own reference until it completes.
+    fn release_idle_external_surfaces(&mut self) {
+        self.external_surface_frame += 1;
+        let frame = self.external_surface_frame;
+        let count = self.external_surface_textures.len();
+        self.external_surface_textures
+            .retain(|_, (_, last_drawn)| frame - *last_drawn <= EXTERNAL_SURFACE_IDLE_FRAMES);
+        if self.external_surface_textures.len() != count {
+            self.core_video_texture_cache.flush(0);
+        }
+    }
+
     fn draw_primitives_to_texture(
         &mut self,
         scene: &Scene,
@@ -930,6 +951,7 @@ impl MetalRenderer {
         viewport_size: Size<DevicePixels>,
     ) -> Result<metal::CommandBuffer> {
         self.prepare_intermediate_textures(scene, viewport_size);
+        self.release_idle_external_surfaces();
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
         // Wait on each producer fence in the command buffer that samples its
@@ -1892,9 +1914,11 @@ impl MetalRenderer {
                     log::error!("Metal external surface has an invalid BGRA descriptor");
                     continue;
                 }
-                let texture = if let Some(texture) =
-                    self.external_surface_textures.get(&descriptor.identity)
+                let frame = self.external_surface_frame;
+                let texture = if let Some((texture, last_drawn)) =
+                    self.external_surface_textures.get_mut(&descriptor.identity)
                 {
+                    *last_drawn = frame;
                     if external_surface_trace_enabled() {
                         eprintln!(
                             "[GPUI-CE/ExternalMetal] texture cache=hit resource={} gen={} iosurface={}",
@@ -1928,7 +1952,7 @@ impl MetalRenderer {
                         }
                     };
                     self.external_surface_textures
-                        .insert(descriptor.identity, imported.clone());
+                        .insert(descriptor.identity, (imported.clone(), frame));
                     if external_surface_trace_enabled() {
                         eprintln!(
                             "[GPUI-CE/ExternalMetal] texture import=complete resource={} gen={} iosurface={} visible={}x{} backing={}x{}",
