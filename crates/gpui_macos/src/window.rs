@@ -1037,6 +1037,9 @@ impl MacWindowState {
         let enabled = !self.traffic_light_hover_behavior
             || self.traffic_light_hovered
             || self.is_fullscreen();
+        // Enabling a button under the pointer does not replay its native
+        // mouse-enter event, so set its AppKit highlight state with the cluster.
+        let highlighted = self.traffic_light_hover_behavior && self.traffic_light_hovered;
         let mut enabled_state_changed = false;
         unsafe {
             for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
@@ -1044,6 +1047,11 @@ impl MacWindowState {
                 if is_enabled != Bool::new(enabled) {
                     let _: () = msg_send![&**button, setEnabled: Bool::new(enabled)];
                     enabled_state_changed = true;
+                }
+
+                let is_highlighted: Bool = msg_send![&**button, isHighlighted];
+                if is_highlighted != Bool::new(highlighted) {
+                    let _: () = msg_send![&**button, setHighlighted: Bool::new(highlighted)];
                 }
             }
         }
