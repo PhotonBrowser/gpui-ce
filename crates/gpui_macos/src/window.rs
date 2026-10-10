@@ -913,10 +913,9 @@ impl MacWindowState {
     }
 
     fn move_traffic_light(&mut self) {
-        if self.traffic_light_position.is_some()
-            && self.is_fullscreen()
-            && !self.traffic_light_hover_behavior
-        {
+        // AppKit owns the transient fullscreen titlebar. Repositioning its
+        // controls while that titlebar is revealed can dismiss the overlay.
+        if self.is_fullscreen() {
             self.restore_traffic_light();
             return;
         }
@@ -1032,11 +1031,11 @@ impl MacWindowState {
             }
         }
 
-        // AppKit can temporarily hide the titlebar's tracking area in fullscreen,
-        // so keep its native controls enabled whenever the titlebar is available.
-        let enabled = !self.traffic_light_hover_behavior
-            || self.traffic_light_hovered
-            || self.is_fullscreen();
+        // Keep native controls enabled throughout fullscreen; AppKit owns their
+        // hover state along with the transient titlebar.
+        let fullscreen = self.is_fullscreen();
+        let enabled =
+            !self.traffic_light_hover_behavior || self.traffic_light_hovered || fullscreen;
         // Enabling a button under the pointer does not replay its native
         // mouse-enter event, so set its AppKit highlight state with the cluster.
         let highlighted = self.traffic_light_hover_behavior && self.traffic_light_hovered;
@@ -1049,9 +1048,14 @@ impl MacWindowState {
                     enabled_state_changed = true;
                 }
 
-                let is_highlighted: Bool = msg_send![&**button, isHighlighted];
-                if is_highlighted != Bool::new(highlighted) {
-                    let _: () = msg_send![&**button, setHighlighted: Bool::new(highlighted)];
+                // In native fullscreen, AppKit owns hover/highlight state along
+                // with the transient titlebar. Leave it alone so hovering the
+                // titlebar cannot dismiss or fight its reveal animation.
+                if !fullscreen {
+                    let is_highlighted: Bool = msg_send![&**button, isHighlighted];
+                    if is_highlighted != Bool::new(highlighted) {
+                        let _: () = msg_send![&**button, setHighlighted: Bool::new(highlighted)];
+                    }
                 }
             }
         }
@@ -1059,7 +1063,7 @@ impl MacWindowState {
     }
 
     fn update_traffic_light_hover(&mut self, pointer: Objc2NSPoint) {
-        if !self.traffic_light_hover_behavior {
+        if !self.traffic_light_hover_behavior || self.is_fullscreen() {
             return;
         }
 
@@ -1097,7 +1101,7 @@ impl MacWindowState {
         let button_rects: [Objc2NSRect; 3] = [&buttons.close, &buttons.minimize, &buttons.zoom]
             .map(|button| {
                 let bounds: Objc2NSRect = unsafe { msg_send![&**button, bounds] };
-                unsafe { msg_send![&**button, convertRect: bounds toView: view] }
+                unsafe { msg_send![&**button, convertRect: bounds, toView: view] }
             });
         let min_x = button_rects
             .iter()
@@ -3277,10 +3281,9 @@ unsafe extern "C" fn window_will_enter_fullscreen(this: &Objc2Object, _: Sel, _:
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.fullscreen_restore_bounds = lock.bounds();
-    let preserves_traffic_light_position = lock.traffic_light_hover_behavior;
-    if !preserves_traffic_light_position {
-        lock.restore_traffic_light();
-    }
+    // Return the controls to AppKit before it creates the transient fullscreen
+    // titlebar. Photon reapplies its custom position after fullscreen exits.
+    lock.restore_traffic_light();
 
     let min_version = NSOperatingSystemVersion {
         majorVersion: 15,
@@ -3293,10 +3296,6 @@ unsafe extern "C" fn window_will_enter_fullscreen(this: &Objc2Object, _: Sel, _:
             lock.native_window
                 .setTitlebarAppearsTransparent_(Bool::new(false));
         }
-    }
-
-    if preserves_traffic_light_position {
-        lock.move_traffic_light();
     }
 }
 
