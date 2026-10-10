@@ -65,6 +65,7 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const TRAFFIC_LIGHT_HOVER_PADDING: f64 = 8.0;
 
 unsafe fn set_window_state_ivar(object: ObjcId, state: *mut c_void) {
     let object = unsafe { &mut *object };
@@ -86,16 +87,27 @@ fn ns_string(value: &str) -> Retained<NSString> {
 }
 
 fn add_mouse_tracking_area(native_view: ObjcId) {
+    add_mouse_tracking_area_for_owner(native_view, native_view);
+}
+
+fn add_mouse_tracking_area_for_owner(tracking_view: ObjcId, owner: ObjcId) {
     unsafe {
         let tracking_area: ObjcId = msg_send![class!(NSTrackingArea), alloc];
+        let options = NSTrackingMouseEnteredAndExited
+            | NSTrackingMouseMoved
+            | NSTrackingActiveAlways
+            | NSTrackingInVisibleRect;
         let tracking_area: ObjcId = msg_send![
             tracking_area,
-            initWithRect: Objc2NSRect::new(Objc2NSPoint::new(0., 0.), NSSize::new(0., 0.)),
-            options: NSTrackingMouseEnteredAndExited | NSTrackingMouseMoved | NSTrackingActiveAlways | NSTrackingInVisibleRect,
-            owner: native_view,
+            initWithRect: Objc2NSRect::new(
+                Objc2NSPoint::new(0., 0.),
+                NSSize::new(0., 0.)
+            ),
+            options: options,
+            owner: owner,
             userInfo: NIL
         ];
-        let _: () = msg_send![native_view, addTrackingArea: tracking_area.autorelease()];
+        let _: () = msg_send![tracking_view, addTrackingArea: tracking_area.autorelease()];
     }
 }
 
@@ -400,6 +412,10 @@ unsafe fn build_classes() {
                 handle_view_event as unsafe extern "C" fn(_, _, _),
             );
             decl.add_method(
+                sel!(mouseEntered:),
+                handle_view_event as unsafe extern "C" fn(_, _, _),
+            );
+            decl.add_method(
                 sel!(resetCursorRects),
                 reset_cursor_rects as unsafe extern "C" fn(_, _),
             );
@@ -629,6 +645,10 @@ unsafe fn build_window_class(
             window_will_enter_fullscreen as unsafe extern "C" fn(_, _, _),
         );
         decl.add_method(
+            sel!(windowDidEnterFullScreen:),
+            window_did_enter_fullscreen as unsafe extern "C" fn(_, _, _),
+        );
+        decl.add_method(
             sel!(windowWillExitFullScreen:),
             window_will_exit_fullscreen as unsafe extern "C" fn(_, _, _),
         );
@@ -855,6 +875,9 @@ struct MacWindowState {
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
     traffic_light_frames: Option<TrafficLightFrames>,
+    traffic_light_hover_behavior: bool,
+    traffic_light_hovered: bool,
+    traffic_light_tracking_container: Option<usize>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
@@ -890,63 +913,76 @@ impl MacWindowState {
     }
 
     fn move_traffic_light(&mut self) {
-        if let Some(traffic_light_position) = self.traffic_light_position {
-            if self.is_fullscreen() {
-                self.restore_traffic_light();
-                return;
-            }
-
-            if self.traffic_light_frames.is_none() {
-                self.traffic_light_frames = self.capture_traffic_light_frames();
-            }
-
-            let window_height = Pixels::from(self.native_window().frame().size.height);
-            if self.traffic_light_frames.is_some() {
-                // AppKit can recreate standard buttons, so fetch the live views for each layout pass.
-                let Some(buttons) = self.traffic_light_buttons() else {
-                    return;
-                };
-                let Some(titlebar_container) = Self::titlebar_container(&buttons.close) else {
-                    return;
-                };
-
-                let close_frame = buttons.close.frame();
-                let minimize_frame = buttons.minimize.frame();
-                let button_width = Pixels::from(close_frame.size.width);
-                let button_height = Pixels::from(close_frame.size.height);
-                let button_padding = Pixels::from(
-                    minimize_frame.origin.x - close_frame.origin.x - close_frame.size.width,
-                );
-                let container_height =
-                    button_height + traffic_light_position.y + traffic_light_position.y;
-
-                let mut titlebar_frame = titlebar_container.frame();
-                titlebar_frame.size.height = container_height.to_f64();
-                titlebar_frame.origin.y = (window_height - container_height).to_f64();
-
-                let minimize_x = traffic_light_position.x + button_width + button_padding;
-                let zoom_x = minimize_x + button_width + button_padding;
-
-                titlebar_container.setFrame(titlebar_frame);
-                buttons.close.setFrameOrigin(Objc2NSPoint::new(
-                    traffic_light_position.x.to_f64(),
-                    traffic_light_position.y.to_f64(),
-                ));
-                buttons.minimize.setFrameOrigin(Objc2NSPoint::new(
-                    minimize_x.to_f64(),
-                    traffic_light_position.y.to_f64(),
-                ));
-                buttons.zoom.setFrameOrigin(Objc2NSPoint::new(
-                    zoom_x.to_f64(),
-                    traffic_light_position.y.to_f64(),
-                ));
-
-                titlebar_container.updateTrackingAreas();
-                buttons.close.updateTrackingAreas();
-                buttons.minimize.updateTrackingAreas();
-                buttons.zoom.updateTrackingAreas();
-            }
+        if self.traffic_light_position.is_some()
+            && self.is_fullscreen()
+            && !self.traffic_light_hover_behavior
+        {
+            self.restore_traffic_light();
+            return;
         }
+
+        self.position_traffic_light();
+        if self.update_traffic_light_hover_appearance() {
+            // AppKit can relayout a standard button when its enabled state changes.
+            // Reapply Photon’s saved geometry after that state transition.
+            self.position_traffic_light();
+            self.update_traffic_light_hover_appearance();
+        }
+    }
+
+    fn position_traffic_light(&mut self) {
+        let Some(traffic_light_position) = self.traffic_light_position else {
+            return;
+        };
+
+        if self.traffic_light_frames.is_none() {
+            self.traffic_light_frames = self.capture_traffic_light_frames();
+        }
+
+        let Some(frames) = self.traffic_light_frames.as_ref() else {
+            return;
+        };
+        // AppKit can recreate standard buttons, so fetch the live views for each layout pass.
+        let Some(buttons) = self.traffic_light_buttons() else {
+            return;
+        };
+        let Some(titlebar_container) = Self::titlebar_container(&buttons.close) else {
+            return;
+        };
+
+        let window_height = Pixels::from(self.native_window().frame().size.height);
+        let button_width = Pixels::from(frames.close.size.width);
+        let button_height = Pixels::from(frames.close.size.height);
+        let button_padding = Pixels::from(
+            frames.minimize.origin.x - frames.close.origin.x - frames.close.size.width,
+        );
+        let container_height = button_height + traffic_light_position.y + traffic_light_position.y;
+
+        let mut titlebar_frame = titlebar_container.frame();
+        titlebar_frame.size.height = container_height.to_f64();
+        titlebar_frame.origin.y = (window_height - container_height).to_f64();
+
+        let minimize_x = traffic_light_position.x + button_width + button_padding;
+        let zoom_x = minimize_x + button_width + button_padding;
+
+        titlebar_container.setFrame(titlebar_frame);
+        buttons.close.setFrameOrigin(Objc2NSPoint::new(
+            traffic_light_position.x.to_f64(),
+            traffic_light_position.y.to_f64(),
+        ));
+        buttons.minimize.setFrameOrigin(Objc2NSPoint::new(
+            minimize_x.to_f64(),
+            traffic_light_position.y.to_f64(),
+        ));
+        buttons.zoom.setFrameOrigin(Objc2NSPoint::new(
+            zoom_x.to_f64(),
+            traffic_light_position.y.to_f64(),
+        ));
+
+        titlebar_container.updateTrackingAreas();
+        buttons.close.updateTrackingAreas();
+        buttons.minimize.updateTrackingAreas();
+        buttons.zoom.updateTrackingAreas();
     }
 
     fn capture_traffic_light_frames(&self) -> Option<TrafficLightFrames> {
@@ -977,6 +1013,69 @@ impl MacWindowState {
         })
     }
 
+    fn update_traffic_light_hover_appearance(&mut self) -> bool {
+        let Some(buttons) = self.traffic_light_buttons() else {
+            return false;
+        };
+
+        if self.traffic_light_hover_behavior
+            && let Some(titlebar_container) = Self::titlebar_container(&buttons.close)
+        {
+            let container = Retained::as_ptr(&titlebar_container);
+            let container_id = container as usize;
+            if self.traffic_light_tracking_container != Some(container_id) {
+                add_mouse_tracking_area_for_owner(
+                    container.cast_mut().cast(),
+                    self.native_view.as_ptr(),
+                );
+                self.traffic_light_tracking_container = Some(container_id);
+            }
+        }
+
+        // AppKit can temporarily hide the titlebar's tracking area in fullscreen,
+        // so keep its native controls enabled whenever the titlebar is available.
+        let enabled = !self.traffic_light_hover_behavior
+            || self.traffic_light_hovered
+            || self.is_fullscreen();
+        let mut enabled_state_changed = false;
+        unsafe {
+            for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
+                let is_enabled: Bool = msg_send![&**button, isEnabled];
+                if is_enabled != Bool::new(enabled) {
+                    let _: () = msg_send![&**button, setEnabled: Bool::new(enabled)];
+                    enabled_state_changed = true;
+                }
+            }
+        }
+        enabled_state_changed
+    }
+
+    fn update_traffic_light_hover(&mut self, pointer: Objc2NSPoint) {
+        if !self.traffic_light_hover_behavior {
+            return;
+        }
+
+        let Some(buttons) = self.traffic_light_buttons() else {
+            return;
+        };
+        let hover_rect = Self::traffic_light_hover_rect(&buttons, NIL);
+        let hovered = pointer.x >= hover_rect.origin.x
+            && pointer.x <= hover_rect.origin.x + hover_rect.size.width
+            && pointer.y >= hover_rect.origin.y
+            && pointer.y <= hover_rect.origin.y + hover_rect.size.height;
+
+        if hovered != self.traffic_light_hovered {
+            self.traffic_light_hovered = hovered;
+            self.move_traffic_light();
+        }
+    }
+
+    fn set_traffic_light_hover_behavior(&mut self, enabled: bool) {
+        self.traffic_light_hover_behavior = enabled;
+        self.traffic_light_hovered = false;
+        self.move_traffic_light();
+    }
+
     fn titlebar_container(close_button: &Objc2NSButton) -> Option<Retained<Objc2NSView>> {
         // SAFETY: `close_button` comes from AppKit's `standardWindowButton(_:)`.
         // Although `superview` is unsafe, objc2 returns each result as `Retained<NSView>`.
@@ -986,7 +1085,42 @@ impl MacWindowState {
         }
     }
 
+    fn traffic_light_hover_rect(buttons: &TrafficLightButtons, view: ObjcId) -> Objc2NSRect {
+        let button_rects: [Objc2NSRect; 3] = [&buttons.close, &buttons.minimize, &buttons.zoom]
+            .map(|button| {
+                let bounds: Objc2NSRect = unsafe { msg_send![&**button, bounds] };
+                unsafe { msg_send![&**button, convertRect: bounds toView: view] }
+            });
+        let min_x = button_rects
+            .iter()
+            .map(|rect| rect.origin.x)
+            .fold(f64::INFINITY, f64::min)
+            - TRAFFIC_LIGHT_HOVER_PADDING;
+        let min_y = button_rects
+            .iter()
+            .map(|rect| rect.origin.y)
+            .fold(f64::INFINITY, f64::min)
+            - TRAFFIC_LIGHT_HOVER_PADDING;
+        let max_x = button_rects
+            .iter()
+            .map(|rect| rect.origin.x + rect.size.width)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + TRAFFIC_LIGHT_HOVER_PADDING;
+        let max_y = button_rects
+            .iter()
+            .map(|rect| rect.origin.y + rect.size.height)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + TRAFFIC_LIGHT_HOVER_PADDING;
+
+        Objc2NSRect::new(
+            Objc2NSPoint::new(min_x, min_y),
+            NSSize::new(max_x - min_x, max_y - min_y),
+        )
+    }
+
     fn restore_traffic_light(&mut self) {
+        self.traffic_light_hovered = false;
+        self.update_traffic_light_hover_appearance();
         if let Some(frames) = self.traffic_light_frames.take() {
             let Some(buttons) = self.traffic_light_buttons() else {
                 return;
@@ -1005,6 +1139,8 @@ impl MacWindowState {
             buttons.minimize.updateTrackingAreas();
             buttons.zoom.updateTrackingAreas();
         }
+
+        self.update_traffic_light_hover_appearance();
     }
 
     fn start_display_link(&mut self) {
@@ -1297,6 +1433,9 @@ impl MacWindow {
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
                 traffic_light_frames: None,
+                traffic_light_hover_behavior: false,
+                traffic_light_hovered: false,
+                traffic_light_tracking_container: None,
                 transparent_titlebar: titlebar
                     .as_ref()
                     .is_none_or(|titlebar| titlebar.appears_transparent),
@@ -1668,6 +1807,20 @@ impl PlatformWindow for MacWindow {
         let mut state = self.0.lock();
         state.traffic_light_position = Some(position);
         state.move_traffic_light();
+    }
+
+    fn set_traffic_light_hover_behavior(&self, enabled: bool) {
+        self.0.lock().set_traffic_light_hover_behavior(enabled);
+    }
+
+    fn set_traffic_lights_hidden(&self, hidden: bool) {
+        let state = self.0.lock();
+        let Some(buttons) = state.traffic_light_buttons() else {
+            return;
+        };
+        for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
+            button.setHidden(hidden);
+        }
     }
 
     fn scale_factor(&self) -> f32 {
@@ -2932,6 +3085,13 @@ unsafe extern "C" fn handle_view_event(this: &Objc2Object, _: Sel, native_event:
     let window_height = lock.content_size().height;
     let native_event_type = unsafe { native_event.eventType() };
     match native_event_type {
+        NSEventType::MouseEntered | NSEventType::MouseMoved | NSEventType::MouseExited => {
+            let pointer: Objc2NSPoint = unsafe { msg_send![native_event, locationInWindow] };
+            lock.update_traffic_light_hover(pointer);
+        }
+        _ => {}
+    }
+    match native_event_type {
         NSEventType::LeftMouseDown => {
             // AppKit owns `native_event` for the callback; retain it so the drag session can still
             // be started later, once the pointer leaves the window.
@@ -3109,7 +3269,10 @@ unsafe extern "C" fn window_will_enter_fullscreen(this: &Objc2Object, _: Sel, _:
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.as_ref().lock();
     lock.fullscreen_restore_bounds = lock.bounds();
-    lock.restore_traffic_light();
+    let preserves_traffic_light_position = lock.traffic_light_hover_behavior;
+    if !preserves_traffic_light_position {
+        lock.restore_traffic_light();
+    }
 
     let min_version = NSOperatingSystemVersion {
         majorVersion: 15,
@@ -3122,6 +3285,10 @@ unsafe extern "C" fn window_will_enter_fullscreen(this: &Objc2Object, _: Sel, _:
             lock.native_window
                 .setTitlebarAppearsTransparent_(Bool::new(false));
         }
+    }
+
+    if preserves_traffic_light_position {
+        lock.move_traffic_light();
     }
 }
 
@@ -3141,6 +3308,11 @@ unsafe extern "C" fn window_will_exit_fullscreen(this: &Objc2Object, _: Sel, _: 
                 .setTitlebarAppearsTransparent_(Bool::new(true));
         }
     }
+}
+
+unsafe extern "C" fn window_did_enter_fullscreen(this: &Objc2Object, _: Sel, _: ObjcId) {
+    let window_state = unsafe { get_window_state(this) };
+    window_state.as_ref().lock().move_traffic_light();
 }
 
 unsafe extern "C" fn window_did_exit_fullscreen(this: &Objc2Object, _: Sel, _: ObjcId) {

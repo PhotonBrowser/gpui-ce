@@ -2882,6 +2882,21 @@ impl Window {
         self.platform_window.set_traffic_light_position(position);
     }
 
+    /// Disables macOS traffic lights outside their control cluster and enables
+    /// them on hover. Set to `false` to leave their enabled state to AppKit.
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_light_hover_behavior(&self, enabled: bool) {
+        self.platform_window
+            .set_traffic_light_hover_behavior(enabled);
+    }
+
+    /// Hides the macOS traffic light buttons, or shows them again, for
+    /// windows whose titlebar content can collapse out of view.
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_lights_hidden(&self, hidden: bool) {
+        self.platform_window.set_traffic_lights_hidden(hidden);
+    }
+
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);

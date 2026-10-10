@@ -955,6 +955,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
+    /// Enables or disables macOS traffic lights as a group when the pointer
+    /// enters or leaves their control cluster.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_light_hover_behavior(&self, _enabled: bool) {}
+    /// Hides or shows the macOS traffic lights.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_lights_hidden(&self, _hidden: bool) {}
     /// Show the platform character palette.
     ///
     /// The default implementation logs a warning when the backend does not
