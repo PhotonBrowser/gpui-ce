@@ -208,8 +208,9 @@ pub(crate) unsafe fn platform_input_from_native(
             NSEventType::Swipe => {
                 let navigation_direction = match native_event.phase() {
                     NSEventPhase::Ended => match native_event.deltaX() {
-                        x if x > 0.0 => Some(NavigationDirection::Back),
-                        x if x < 0.0 => Some(NavigationDirection::Forward),
+                        // AppKit reports a negative delta for a swipe to the right.
+                        x if x < 0.0 => Some(NavigationDirection::Back),
+                        x if x > 0.0 => Some(NavigationDirection::Forward),
                         _ => return None,
                     },
                     _ => return None,
