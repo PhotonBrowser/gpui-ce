@@ -1012,6 +1012,7 @@ fn scroll_event(
         delta: ScrollDelta::Pixels(delta),
         modifiers: Modifiers::default(),
         touch_phase,
+        ..Default::default()
     }
 }
 

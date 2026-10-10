@@ -531,6 +531,23 @@ pub struct ScrollWheelEvent {
 
     /// The phase of the touch event.
     pub touch_phase: TouchPhase,
+
+    /// Whether this event is part of the platform's inertial scrolling phase.
+    /// Platforms without a distinct momentum phase leave this false.
+    pub is_momentum: bool,
+
+    /// Whether the platform's inertial scrolling phase has ended.
+    /// This is separate from `touch_phase`, because macOS can begin momentum on the same event that ends touch input.
+    pub is_momentum_ended: bool,
+
+    /// Whether the native event has a gesture phase, as opposed to a wheel-like delta with no gesture lifecycle.
+    pub has_native_phase: bool,
+
+    /// Whether macOS has swipe-between-pages enabled for scroll events.
+    pub is_swipe_tracking_enabled: bool,
+
+    /// Whether native scrolling deltas are inverted from physical device motion.
+    pub is_direction_inverted_from_device: bool,
 }
 
 impl Sealed for ScrollWheelEvent {}

@@ -658,6 +658,7 @@ impl WebWindowInner {
                 delta,
                 modifiers,
                 touch_phase: TouchPhase::Moved,
+                ..Default::default()
             }));
         })
     }

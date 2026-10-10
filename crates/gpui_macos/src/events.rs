@@ -252,11 +252,21 @@ pub(crate) unsafe fn platform_input_from_native(
                 })
             }),
             NSEventType::ScrollWheel => window_height.map(|window_height| {
-                let phase = match native_event.phase() {
+                let native_phase = native_event.phase();
+                let phase = match native_phase {
                     NSEventPhase::MayBegin | NSEventPhase::Began => TouchPhase::Started,
                     NSEventPhase::Ended => TouchPhase::Ended,
+                    NSEventPhase::Cancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
+                let momentum_phase = native_event.momentumPhase();
+                let is_momentum = momentum_phase != NSEventPhase::None;
+                let is_momentum_ended = momentum_phase == NSEventPhase::Ended
+                    || momentum_phase == NSEventPhase::Cancelled;
+                let has_native_phase = native_phase != NSEventPhase::None;
+                let is_swipe_tracking_enabled = NSEvent::isSwipeTrackingFromScrollEventsEnabled();
+                let is_direction_inverted_from_device =
+                    native_event.isDirectionInvertedFromDevice();
 
                 let raw_data = point(
                     native_event.scrollingDeltaX() as f32,
@@ -276,6 +286,11 @@ pub(crate) unsafe fn platform_input_from_native(
                     ),
                     delta,
                     touch_phase: phase,
+                    is_momentum,
+                    is_momentum_ended,
+                    has_native_phase,
+                    is_swipe_tracking_enabled,
+                    is_direction_inverted_from_device,
                     modifiers: read_modifiers(native_event),
                 })
             }),
