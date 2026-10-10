@@ -190,9 +190,12 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSAlert",
   "NSApplication",
   "NSDocumentController",
+  "NSAccessibility",
   "NSAppearance",
+  "NSBezierPath",
   "NSButton",
   "NSCell",
+  "NSColor",
   "NSControl",
   "NSEvent",
   "NSGraphics",
@@ -205,6 +208,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSSavePanel",
   "NSScroller",
   "NSWorkspace",
+  "objc2-quartz-core",
   "NSVisualEffectView",
   "NSPasteboard",
   "NSPasteboardItem",
@@ -222,8 +226,13 @@ objc2-core-media = { version = "0.3", default-features = false, features = [
   "objc2",
 ] }
 objc2-quartz-core = { version = "0.3", default-features = false, features = [
+  "CAAnimation",
   "CALayer",
+  "CAMediaTiming",
+  "CAMediaTimingFunction",
   "CAMetalLayer",
+  "CATransaction",
+  "objc2-core-foundation",
   "objc2-core-graphics",
 ] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = [

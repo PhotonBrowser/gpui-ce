@@ -28,23 +28,27 @@ use foreign_types::ForeignTypeRef;
 use futures::channel::oneshot;
 use gpui_util::ResultExt;
 use objc2::{
-    AnyThread, MainThreadMarker, class, msg_send,
+    AnyThread, MainThreadMarker, MainThreadOnly, class, define_class, msg_send,
     rc::Retained,
     runtime::{AnyClass, AnyObject as Objc2Object, AnyProtocol, Bool, ClassBuilder, Sel},
     sel,
 };
 use objc2_app_kit::{
-    NSAlert, NSAlertStyle, NSBackingStoreType, NSBeep, NSButton as Objc2NSButton,
-    NSEventModifierFlags, NSEventType, NSRequestUserAttentionType, NSScreen, NSTrackingArea,
-    NSTrackingAreaOptions, NSView as Objc2NSView, NSViewLayerContentsRedrawPolicy,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior,
-    NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSAlert, NSAlertStyle, NSAppearanceCustomization, NSAppearanceNameAqua,
+    NSAppearanceNameDarkAqua, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep, NSBezierPath,
+    NSButton as Objc2NSButton, NSColor, NSEventModifierFlags, NSEventType,
+    NSRequestUserAttentionType, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions,
+    NSView as Objc2NSView, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSWindow as Objc2NSWindow,
+    NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_foundation::{
-    NSInteger, NSNotFound, NSOperatingSystemVersion, NSPoint as Objc2NSPoint, NSRange,
-    NSRangePointer, NSRect as Objc2NSRect, NSSize, NSString, NSUInteger,
+    NSArray, NSInteger, NSNotFound, NSNumber, NSObject, NSOperatingSystemVersion,
+    NSPoint as Objc2NSPoint, NSRange, NSRangePointer, NSRect as Objc2NSRect, NSSize, NSString,
+    NSUInteger,
 };
+use objc2_quartz_core::{CABasicAnimation, CAMediaTiming, CAMediaTimingFunction, CATransaction};
 use parking_lot::Mutex;
 use raw_window_handle as rwh;
 use smallvec::SmallVec;
@@ -66,6 +70,11 @@ use std::{
 
 const WINDOW_STATE_IVAR: &str = "windowState";
 const TRAFFIC_LIGHT_HOVER_PADDING: f64 = 8.0;
+// Calibrated to the muted discs AppKit shows for an inactive window.
+const TRAFFIC_LIGHT_REST_OPACITY_DARK: f64 = 0.17;
+const TRAFFIC_LIGHT_REST_OPACITY_LIGHT: f64 = 0.13;
+const TRAFFIC_LIGHT_HOVER_FADE_SECONDS: f64 = 0.14;
+const TRAFFIC_LIGHT_REST_FADE_SECONDS: f64 = 0.24;
 
 unsafe fn set_window_state_ivar(object: ObjcId, state: *mut c_void) {
     let object = unsafe { &mut *object };
@@ -766,6 +775,107 @@ struct TrafficLightTrackingArea {
     rect: Objc2NSRect,
 }
 
+struct TrafficLightRestingViewEntry {
+    container: Retained<Objc2NSView>,
+    view: Retained<TrafficLightRestingView>,
+}
+
+define_class!(
+    #[unsafe(super(Objc2NSView, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "GPUITrafficLightRestingView"]
+    #[ivars = ()]
+    struct TrafficLightRestingView;
+
+    impl TrafficLightRestingView {
+        // Let AppKit's real traffic-light buttons receive all hit tests.
+        #[unsafe(method(hitTest:))]
+        fn hit_test(&self, _point: Objc2NSPoint) -> ObjcId {
+            NIL
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: Objc2NSRect) {
+            let (white, alpha) = if self.is_dark_appearance() {
+                (1.0, TRAFFIC_LIGHT_REST_OPACITY_DARK)
+            } else {
+                (0.0, TRAFFIC_LIGHT_REST_OPACITY_LIGHT)
+            };
+            NSColor::colorWithWhite_alpha(white, alpha).setFill();
+            for rect in self.control_rects() {
+                NSBezierPath::bezierPathWithOvalInRect(rect).fill();
+            }
+        }
+
+        #[unsafe(method(viewDidChangeEffectiveAppearance))]
+        fn appearance_changed(&self) {
+            self.setNeedsDisplay(true);
+        }
+    }
+);
+
+impl TrafficLightRestingView {
+    fn new(mtm: MainThreadMarker, frame: Objc2NSRect) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(());
+        // SAFETY: `initWithFrame:` is NSView's designated initializer.
+        unsafe { msg_send![super(this), initWithFrame: frame] }
+    }
+
+    fn control_rects(&self) -> Vec<Objc2NSRect> {
+        let Some(window) = self.window() else {
+            return Vec::new();
+        };
+        [
+            Objc2NSWindowButton::CloseButton,
+            Objc2NSWindowButton::MiniaturizeButton,
+            Objc2NSWindowButton::ZoomButton,
+        ]
+        .into_iter()
+        .filter_map(|kind| window.standardWindowButton(kind))
+        .filter_map(|button| {
+            // SAFETY: the button is a live standard window button on this thread.
+            let parent = unsafe { button.superview() };
+            Some(self.convertRect_fromView(button.frame(), parent.as_deref()))
+        })
+        .collect()
+    }
+
+    fn is_dark_appearance(&self) -> bool {
+        // SAFETY: immutable AppKit appearance constants.
+        let (aqua, dark) = unsafe { (NSAppearanceNameAqua, NSAppearanceNameDarkAqua) };
+        self.effectiveAppearance()
+            .bestMatchFromAppearancesWithNames(&NSArray::from_slice(&[aqua, dark]))
+            .is_some_and(|name| name.isEqualToString(dark))
+    }
+}
+
+fn fade_traffic_light_view(view: &Objc2NSView, opacity: f32, duration: f64) {
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    // SAFETY: this reads the live presentation state on AppKit's main thread.
+    let from =
+        unsafe { layer.presentationLayer() }.map_or(layer.opacity(), |shown| shown.opacity());
+    CATransaction::begin();
+    CATransaction::setDisableActions(true);
+    layer.setOpacity(opacity);
+    layer.removeAnimationForKey(&ns_string("opacity"));
+    if duration > 0.0 && (from - opacity).abs() > f32::EPSILON {
+        let animation = CABasicAnimation::animationWithKeyPath(Some(&ns_string("opacity")));
+        // SAFETY: NSNumber is the value type Core Animation expects for scalar opacity.
+        unsafe {
+            animation.setFromValue(Some(&NSNumber::new_f32(from)));
+            animation.setToValue(Some(&NSNumber::new_f32(opacity)));
+        }
+        animation.setDuration(duration);
+        animation.setTimingFunction(Some(&CAMediaTimingFunction::functionWithControlPoints(
+            0.22, 1.0, 0.36, 1.0,
+        )));
+        layer.addAnimation_forKey(&animation, Some(&ns_string("opacity")));
+    }
+    CATransaction::commit();
+}
+
 // `NSApplicationPresentationOptions` bits (see `NSApplication.PresentationOptions`).
 const NS_APPLICATION_PRESENTATION_AUTO_HIDE_DOCK: NSUInteger = 1 << 0;
 const NS_APPLICATION_PRESENTATION_AUTO_HIDE_MENU_BAR: NSUInteger = 1 << 2;
@@ -885,6 +995,8 @@ struct MacWindowState {
     traffic_light_hover_behavior: bool,
     traffic_light_hovered: bool,
     traffic_light_tracking_area: Option<TrafficLightTrackingArea>,
+    traffic_light_resting_view: Option<TrafficLightRestingViewEntry>,
+    traffic_light_hover_suspended: bool,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
@@ -922,19 +1034,13 @@ impl MacWindowState {
     fn move_traffic_light(&mut self) {
         // AppKit owns fullscreen placement. Even restoring frames repeatedly
         // while its transient titlebar is revealed can dismiss the overlay.
-        if self.is_fullscreen() {
-            self.remove_traffic_light_tracking_area();
-            self.traffic_light_hovered = false;
+        if self.traffic_light_hover_suspended || self.is_fullscreen() {
+            self.update_traffic_light_hover_appearance();
             return;
         }
 
         self.position_traffic_light();
-        if self.update_traffic_light_hover_appearance() {
-            // AppKit can relayout a standard button when its enabled state changes.
-            // Reapply Photon’s saved geometry after that state transition.
-            self.position_traffic_light();
-            self.update_traffic_light_hover_appearance();
-        }
+        self.update_traffic_light_hover_appearance();
     }
 
     fn position_traffic_light(&mut self) {
@@ -1020,49 +1126,125 @@ impl MacWindowState {
         })
     }
 
-    fn update_traffic_light_hover_appearance(&mut self) -> bool {
+    fn update_traffic_light_hover_appearance(&mut self) {
         let Some(buttons) = self.traffic_light_buttons() else {
             self.remove_traffic_light_tracking_area();
+            self.remove_traffic_light_resting_view();
             self.traffic_light_hovered = false;
-            return false;
+            return;
         };
 
-        let fullscreen = self.is_fullscreen();
-        let hover_behavior_active = if self.traffic_light_hover_behavior && !fullscreen {
-            if let Some(container) = Self::titlebar_container(&buttons.close) {
-                self.ensure_traffic_light_tracking_area(&buttons, container);
-                true
-            } else {
-                self.remove_traffic_light_tracking_area();
-                self.traffic_light_hovered = false;
-                false
-            }
-        } else {
+        if !self.traffic_light_hover_behavior
+            || self.traffic_light_hover_suspended
+            || self.is_fullscreen()
+        {
             self.remove_traffic_light_tracking_area();
             self.traffic_light_hovered = false;
-            false
+            if !self.traffic_light_hover_behavior {
+                self.remove_traffic_light_resting_view();
+            }
+            self.set_traffic_light_visibility(&buttons, true, false);
+            return;
+        }
+
+        // Standard buttons acquire backing layers when AppKit puts the window
+        // on screen. Keep the native controls untouched until then, and retry
+        // on the next layout or activation callback.
+        if [&buttons.close, &buttons.minimize, &buttons.zoom]
+            .into_iter()
+            .any(|button| button.layer().is_none())
+        {
+            self.remove_traffic_light_tracking_area();
+            self.remove_traffic_light_resting_view();
+            self.traffic_light_hovered = false;
+            self.set_traffic_light_visibility(&buttons, true, false);
+            return;
+        }
+
+        let Some(tracking_container) = Self::titlebar_container(&buttons.close) else {
+            self.remove_traffic_light_tracking_area();
+            self.remove_traffic_light_resting_view();
+            self.traffic_light_hovered = false;
+            self.set_traffic_light_visibility(&buttons, true, false);
+            return;
+        };
+        // The resting view shares the buttons' immediate parent so its circles
+        // use their native coordinates and remain beneath the real controls.
+        let Some(button_container) = (unsafe { buttons.close.superview() }) else {
+            self.remove_traffic_light_tracking_area();
+            self.remove_traffic_light_resting_view();
+            self.traffic_light_hovered = false;
+            self.set_traffic_light_visibility(&buttons, true, false);
+            return;
         };
 
-        // If no tracking area is available, leave native controls usable.
-        let enabled = !hover_behavior_active || self.traffic_light_hovered;
-        let highlighted = hover_behavior_active && self.traffic_light_hovered;
-        let mut enabled_state_changed = false;
-        for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
-            if button.isEnabled() != enabled {
-                button.setEnabled(enabled);
-                // Disabled cells don't track the pointer, and enabling them
-                // under the cursor doesn't deliver another mouse-enter event.
-                button.updateTrackingAreas();
-                enabled_state_changed = true;
-            }
+        let animate = self.traffic_light_tracking_area.is_some();
+        self.ensure_traffic_light_resting_view(&buttons, button_container);
+        self.ensure_traffic_light_tracking_area(&buttons, tracking_container);
+        self.set_traffic_light_visibility(&buttons, self.traffic_light_hovered, animate);
+    }
 
-            // Reveal the built-in traffic-light glyphs for the whole group.
-            // AppKit owns hover state in fullscreen, so leave it untouched there.
-            if !fullscreen && button.isHighlighted() != highlighted {
-                button.setHighlighted(highlighted);
+    fn ensure_traffic_light_resting_view(
+        &mut self,
+        buttons: &TrafficLightButtons,
+        container: Retained<Objc2NSView>,
+    ) {
+        let container_ptr = Retained::as_ptr(&container);
+        if let Some(entry) = self.traffic_light_resting_view.as_ref() {
+            if Retained::as_ptr(&entry.container) == container_ptr {
+                entry.view.setFrame(container.bounds());
+                entry.view.setNeedsDisplay(true);
+                return;
             }
         }
-        enabled_state_changed
+
+        self.remove_traffic_light_resting_view();
+        let Some(mtm) = MainThreadMarker::new() else {
+            return;
+        };
+        let view = TrafficLightRestingView::new(mtm, container.bounds());
+        view.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        view.setLayerContentsRedrawPolicy(NSViewLayerContentsRedrawPolicy::DuringViewResize);
+        // SAFETY: AppKit view-layer setup and hierarchy changes run on the main thread.
+        unsafe {
+            let _: () = msg_send![&*view, setWantsLayer: Bool::new(true)];
+        }
+        container.addSubview_positioned_relativeTo(
+            &view,
+            NSWindowOrderingMode::Below,
+            Some(&buttons.close),
+        );
+        self.traffic_light_resting_view = Some(TrafficLightRestingViewEntry { container, view });
+    }
+
+    fn remove_traffic_light_resting_view(&mut self) {
+        if let Some(entry) = self.traffic_light_resting_view.take() {
+            entry.view.removeFromSuperview();
+        }
+    }
+
+    fn set_traffic_light_visibility(
+        &self,
+        buttons: &TrafficLightButtons,
+        visible: bool,
+        animate: bool,
+    ) {
+        let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        let duration = match (animate && !reduce_motion, visible) {
+            (false, _) => 0.0,
+            (true, true) => TRAFFIC_LIGHT_HOVER_FADE_SECONDS,
+            (true, false) => TRAFFIC_LIGHT_REST_FADE_SECONDS,
+        };
+        let button_opacity = if visible { 1.0 } else { 0.0 };
+        for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
+            fade_traffic_light_view(button, button_opacity, duration);
+        }
+        if let Some(entry) = self.traffic_light_resting_view.as_ref() {
+            fade_traffic_light_view(&entry.view, if visible { 0.0 } else { 1.0 }, duration);
+        }
     }
 
     fn ensure_traffic_light_tracking_area(
@@ -1112,6 +1294,7 @@ impl MacWindowState {
 
     fn set_traffic_light_hovered(&mut self, hovered: bool) {
         if !self.traffic_light_hover_behavior
+            || self.traffic_light_hover_suspended
             || self.is_fullscreen()
             || self.traffic_light_hovered == hovered
         {
@@ -1119,11 +1302,14 @@ impl MacWindowState {
         }
 
         self.traffic_light_hovered = hovered;
-        self.move_traffic_light();
+        self.update_traffic_light_hover_appearance();
     }
 
     fn refresh_traffic_light_hover(&mut self) {
-        if !self.traffic_light_hover_behavior || self.is_fullscreen() {
+        if !self.traffic_light_hover_behavior
+            || self.traffic_light_hover_suspended
+            || self.is_fullscreen()
+        {
             return;
         }
 
@@ -1195,10 +1381,13 @@ impl MacWindowState {
     }
 
     fn restore_traffic_light(&mut self) {
+        self.traffic_light_hover_suspended = true;
         self.traffic_light_hovered = false;
-        self.update_traffic_light_hover_appearance();
+        self.remove_traffic_light_tracking_area();
+        if let Some(buttons) = self.traffic_light_buttons() {
+            self.set_traffic_light_visibility(&buttons, true, false);
+        }
         self.restore_traffic_light_frames();
-        self.update_traffic_light_hover_appearance();
     }
 
     fn restore_traffic_light_frames(&mut self) {
@@ -1516,6 +1705,8 @@ impl MacWindow {
                 traffic_light_hover_behavior: false,
                 traffic_light_hovered: false,
                 traffic_light_tracking_area: None,
+                traffic_light_resting_view: None,
+                traffic_light_hover_suspended: false,
                 transparent_titlebar: titlebar
                     .as_ref()
                     .is_none_or(|titlebar| titlebar.appears_transparent),
@@ -3396,7 +3587,9 @@ unsafe extern "C" fn window_did_exit_fullscreen(this: &Objc2Object, _: Sel, _: O
     // SAFETY: This method is registered only on GPUI window classes, which initialize
     // WINDOW_STATE_IVAR with an Arc<Mutex<MacWindowState>> during window creation.
     let window_state = unsafe { get_window_state(this) };
-    window_state.as_ref().lock().move_traffic_light();
+    let mut state = window_state.as_ref().lock();
+    state.traffic_light_hover_suspended = false;
+    state.move_traffic_light();
 }
 
 pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bool {
