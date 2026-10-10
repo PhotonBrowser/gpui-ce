@@ -342,6 +342,9 @@ struct ViewElementState {
     paint_range: Range<PaintIndex>,
     cache_key: ViewElementCacheKey,
     accessed_entities: FxHashSet<EntityId>,
+    /// Element states the view's elements used while it was laid out with its
+    /// parent, before `prepaint_range` began, kept whenever the view is reused.
+    layout_element_states: Vec<(GlobalElementId, TypeId)>,
 }
 
 #[derive(Default)]
@@ -350,6 +353,7 @@ pub struct ViewElementRequestLayoutState {
     element: Option<AnyElement>,
     detached_layout_id: Option<LayoutId>,
     accessed_entities: FxHashSet<EntityId>,
+    layout_element_states: Vec<(GlobalElementId, TypeId)>,
 }
 
 #[derive(Default)]
@@ -412,6 +416,7 @@ impl<V: View> Element for ViewElement<V> {
                     !known || window.dirty_views.contains(&entity_id) || window.refreshing;
 
                 if should_probe {
+                    let states_start = window.accessed_element_states_len();
                     let ((element, detached_layout_id), accessed_entities) = cx
                         .detect_accessed_entities(|cx| {
                             let mut element = render_view(self.view.take().unwrap(), window, cx);
@@ -423,6 +428,7 @@ impl<V: View> Element for ViewElement<V> {
                         layout_id,
                         std::slice::from_ref(&detached_layout_id),
                     );
+                    let layout_element_states = window.accessed_element_states_since(states_start);
 
                     return (
                         layout_id,
@@ -430,6 +436,7 @@ impl<V: View> Element for ViewElement<V> {
                             element: Some(element),
                             detached_layout_id: Some(detached_layout_id),
                             accessed_entities,
+                            layout_element_states,
                         },
                     );
                 }
@@ -499,6 +506,9 @@ impl<V: View> Element for ViewElement<V> {
                             && !window.refreshing
                         {
                             let prepaint_start = window.prepaint_index();
+                            // States used while laying out fall before the
+                            // prepaint range, so keep them separately.
+                            window.keep_element_states(&element_state.layout_element_states);
                             window.reuse_prepaint(element_state.prepaint_range.clone());
                             cx.entities
                                 .extend_accessed(&element_state.accessed_entities);
@@ -550,6 +560,9 @@ impl<V: View> Element for ViewElement<V> {
                                 prepaint_range: prepaint_start..prepaint_end,
                                 paint_range: PaintIndex::default()..PaintIndex::default(),
                                 cache_key,
+                                layout_element_states: mem::take(
+                                    &mut request_layout.layout_element_states,
+                                ),
                             },
                         )
                     },
@@ -629,5 +642,68 @@ pub struct EmptyView;
 impl Render for EmptyView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        Context, Entity, StyleRefinement, TestAppContext, Window, div, prelude::*, px, size,
+    };
+    use std::{cell::Cell, rc::Rc};
+
+    /// Keeps keyed state, which it creates while rendering.
+    struct StatefulView {
+        created: Rc<Cell<usize>>,
+    }
+
+    impl Render for StatefulView {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let created = self.created.clone();
+            window.use_keyed_state("state", cx, move |_, _| created.set(created.get() + 1));
+            div().size_full()
+        }
+    }
+
+    struct RootView {
+        child: Entity<StatefulView>,
+    }
+
+    impl Render for RootView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                self.child
+                    .clone()
+                    .cached(StyleRefinement::default().size_full()),
+            )
+        }
+    }
+
+    /// A cached view that renders while its parent lays out uses element
+    /// state before its prepaint range begins. Reusing the view must keep that
+    /// state, or it is dropped and created afresh the next time the view
+    /// renders, restarting animations and losing keyed state.
+    #[gpui::test]
+    fn test_reused_view_keeps_state_used_while_laid_out(cx: &mut TestAppContext) {
+        let created = Rc::new(Cell::new(0));
+        let window = cx.open_window(size(px(800.), px(600.)), {
+            let created = created.clone();
+            move |_, cx| RootView {
+                child: cx.new(|_| StatefulView { created }),
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(created.get(), 1);
+
+        // Re-render only the root, reusing the cached child.
+        window.update(cx, |_, _, cx| cx.notify()).unwrap();
+        cx.run_until_parked();
+
+        // Render the child again: its state must still be there.
+        window
+            .update(cx, |root, _, cx| root.child.update(cx, |_, cx| cx.notify()))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(created.get(), 1);
     }
 }

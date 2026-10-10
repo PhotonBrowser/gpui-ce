@@ -3751,6 +3751,26 @@ impl Window {
         }
     }
 
+    /// How many element states the frame being drawn has used so far.
+    pub(crate) fn accessed_element_states_len(&self) -> usize {
+        self.next_frame.accessed_element_states.len()
+    }
+
+    /// The element states the frame being drawn has used since `start`.
+    pub(crate) fn accessed_element_states_since(
+        &self,
+        start: usize,
+    ) -> Vec<(GlobalElementId, TypeId)> {
+        self.next_frame.accessed_element_states[start..].to_vec()
+    }
+
+    /// Keeps element states from the last frame into the one being drawn.
+    pub(crate) fn keep_element_states(&mut self, states: &[(GlobalElementId, TypeId)]) {
+        self.next_frame
+            .accessed_element_states
+            .extend(states.iter().cloned());
+    }
+
     pub(crate) fn reuse_prepaint(&mut self, range: Range<PrepaintStateIndex>) {
         self.next_frame.hitboxes.extend(
             self.rendered_frame.hitboxes[range.start.hitboxes_index..range.end.hitboxes_index]
