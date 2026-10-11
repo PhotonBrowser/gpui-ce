@@ -260,6 +260,9 @@ pub trait Platform: 'static {
     }
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap);
+    /// Shows `menu` as a native context menu at the pointer. Platforms
+    /// without native context menus show nothing.
+    fn show_context_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
     fn perform_dock_menu_action(&self, _action: usize) {}
     fn add_recent_document(&self, _path: &Path) {}
     fn update_jump_list(

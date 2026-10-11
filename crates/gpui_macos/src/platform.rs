@@ -29,7 +29,7 @@ use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSAppearance, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
-    NSControlStateValueOn, NSCursor, NSDocumentController, NSEventModifierFlags, NSMenu,
+    NSControlStateValueOn, NSCursor, NSDocumentController, NSEvent, NSEventModifierFlags, NSMenu,
     NSMenuDelegate, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSResponder, NSSavePanel,
     NSScroller, NSWorkspace,
 };
@@ -208,6 +208,9 @@ pub(crate) struct MacPlatformState {
     validate_menu_command: Option<Box<dyn FnMut(&dyn Action) -> bool>>,
     will_open_menu: Option<Box<dyn FnMut()>>,
     menu_actions: Vec<Box<dyn Action>>,
+    /// The actions of the context menu shown last, which its items find by
+    /// negative tags, apart from the menu bar's.
+    context_menu_actions: Vec<Box<dyn Action>>,
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<Retained<NSMenu>>,
@@ -246,6 +249,7 @@ impl MacPlatform {
             validate_menu_command: None,
             will_open_menu: None,
             menu_actions: Default::default(),
+            context_menu_actions: Default::default(),
             open_urls: None,
             finish_launching: None,
             dock_menu: None,
@@ -367,16 +371,23 @@ impl MacPlatform {
                     })
                     .map(|binding| binding.keystrokes());
 
-                let selector = match os_action {
-                    Some(gpui::OsAction::Cut) => Some(objc2::sel!(cut:)),
-                    Some(gpui::OsAction::Copy) => Some(objc2::sel!(copy:)),
-                    Some(gpui::OsAction::Paste) => Some(objc2::sel!(paste:)),
-                    Some(gpui::OsAction::SelectAll) => Some(objc2::sel!(selectAll:)),
-                    // "undo:" and "redo:" are always disabled in our case, as
-                    // we don't have a NSTextView/NSTextField to enable them on.
-                    Some(gpui::OsAction::Undo) => Some(objc2::sel!(handleGPUIMenuItem:)),
-                    Some(gpui::OsAction::Redo) => Some(objc2::sel!(handleGPUIMenuItem:)),
-                    None => Some(objc2::sel!(handleGPUIMenuItem:)),
+                // Menus enable items through `validateMenuItem:`, which only
+                // asks whether the action is available. An item without an
+                // action is always disabled, so that is how one stays off.
+                let selector = if *disabled {
+                    None
+                } else {
+                    match os_action {
+                        Some(gpui::OsAction::Cut) => Some(objc2::sel!(cut:)),
+                        Some(gpui::OsAction::Copy) => Some(objc2::sel!(copy:)),
+                        Some(gpui::OsAction::Paste) => Some(objc2::sel!(paste:)),
+                        Some(gpui::OsAction::SelectAll) => Some(objc2::sel!(selectAll:)),
+                        // "undo:" and "redo:" are always disabled in our case, as
+                        // we don't have a NSTextView/NSTextField to enable them on.
+                        Some(gpui::OsAction::Undo) => Some(objc2::sel!(handleGPUIMenuItem:)),
+                        Some(gpui::OsAction::Redo) => Some(objc2::sel!(handleGPUIMenuItem:)),
+                        None => Some(objc2::sel!(handleGPUIMenuItem:)),
+                    }
                 };
 
                 let item;
@@ -1079,6 +1090,43 @@ impl Platform for MacPlatform {
         state.dock_menu = Some(new);
     }
 
+    fn show_context_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
+        let mut state = self.0.lock();
+        let app_delegate = state
+            .app_delegate
+            .clone()
+            .expect("app delegate not initialized");
+        let delegate = ProtocolObject::from_ref(&*app_delegate);
+        let context_menu = NSMenu::new(self.1);
+        context_menu.setDelegate(Some(delegate));
+        let mut actions = Vec::new();
+        for item in &menu {
+            context_menu.addItem(&Self::create_menu_item(
+                item,
+                delegate,
+                &mut actions,
+                keymap,
+                self.1,
+            ));
+        }
+        mark_context_menu_items(&context_menu);
+        state.context_menu_actions = actions;
+        let executor = state.foreground_executor.clone();
+        drop(state);
+        // Menu tracking runs its own event loop until the menu closes, and
+        // choosing an item calls back into the app, so it opens after the
+        // event that asked for it rather than inside it.
+        executor
+            .spawn(async move {
+                context_menu.popUpMenuPositioningItem_atLocation_inView(
+                    None,
+                    NSEvent::mouseLocation(),
+                    None,
+                );
+            })
+            .detach();
+    }
+
     fn add_recent_document(&self, path: &Path) {
         if let Some(path_str) = path.to_str() {
             let document_controller = NSDocumentController::sharedDocumentController(self.1);
@@ -1454,13 +1502,33 @@ fn open_urls(this: &GPUIApplicationDelegate, native_urls: &NSArray<NSURL>) {
     }
 }
 
+/// Gives context menu items negative tags, so their actions are found apart
+/// from the menu bar's, which use the same tags counting up from zero.
+fn mark_context_menu_items(menu: &NSMenu) {
+    for item in menu.itemArray() {
+        if let Some(submenu) = item.submenu() {
+            mark_context_menu_items(&submenu);
+        } else if !item.isSeparatorItem() {
+            item.setTag(-item.tag() - 1);
+        }
+    }
+}
+
+/// The action of the menu bar or context menu item with `tag`.
+fn menu_action(state: &MacPlatformState, tag: NSInteger) -> Option<Box<dyn Action>> {
+    let action = if tag < 0 {
+        state.context_menu_actions.get((-tag - 1) as usize)
+    } else {
+        state.menu_actions.get(tag as usize)
+    };
+    action.map(|action| action.boxed_clone())
+}
+
 fn handle_menu_item(this: &GPUIApplicationDelegate, item: &NSMenuItem) {
     let platform = get_mac_platform(this);
     let mut lock = platform.0.lock();
     if let Some(mut callback) = lock.menu_command.take() {
-        let index = item.tag() as usize;
-        if let Some(action) = lock.menu_actions.get(index) {
-            let action = action.boxed_clone();
+        if let Some(action) = menu_action(&lock, item.tag()) {
             drop(lock);
             callback(&*action);
         }
@@ -1473,9 +1541,7 @@ fn validate_menu_item(this: &GPUIApplicationDelegate, item: &NSMenuItem) -> bool
     let platform = get_mac_platform(this);
     let mut lock = platform.0.lock();
     if let Some(mut callback) = lock.validate_menu_command.take() {
-        let index = item.tag() as usize;
-        if let Some(action) = lock.menu_actions.get(index) {
-            let action = action.boxed_clone();
+        if let Some(action) = menu_action(&lock, item.tag()) {
             drop(lock);
             result = callback(action.as_ref());
         }

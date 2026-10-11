@@ -2516,6 +2516,13 @@ impl App {
         self.platform.get_menus()
     }
 
+    /// Shows `menu` as the platform's native context menu at the pointer.
+    /// Choosing an item dispatches its action as the menu bar does. The
+    /// menu opens once the current event has been handled.
+    pub fn show_context_menu(&self, menu: Vec<MenuItem>) {
+        self.platform.show_context_menu(menu, &self.keymap.borrow());
+    }
+
     /// Sets the right click menu for the app icon in the dock
     pub fn set_dock_menu(&self, menus: Vec<MenuItem>) {
         self.platform.set_dock_menu(menus, &self.keymap.borrow())
