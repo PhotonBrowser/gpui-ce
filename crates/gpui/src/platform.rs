@@ -260,9 +260,18 @@ pub trait Platform: 'static {
     }
 
     fn set_dock_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap);
-    /// Shows `menu` as a native context menu at the pointer. Platforms
-    /// without native context menus show nothing.
-    fn show_context_menu(&self, _menu: Vec<MenuItem>, _keymap: &Keymap) {}
+    /// Shows `menu` as a native context menu at `anchor`, or at the pointer
+    /// without one. The receiver reports whether an item was chosen once the
+    /// menu closes. Platforms without native context menus show nothing and
+    /// drop the sender.
+    fn show_context_menu(
+        &self,
+        _menu: Vec<MenuItem>,
+        _anchor: Option<MenuAnchor>,
+        _keymap: &Keymap,
+    ) -> oneshot::Receiver<bool> {
+        oneshot::channel().1
+    }
     fn perform_dock_menu_action(&self, _action: usize) {}
     fn add_recent_document(&self, _path: &Path) {}
     fn update_jump_list(
@@ -3209,6 +3218,17 @@ pub enum TextRenderingMode {
     Subpixel,
     /// Use grayscale text rendering.
     Grayscale,
+}
+
+/// Where a native menu opens in a window, as a pop-up button's menu opens
+/// under the button, rather than at the pointer.
+pub struct MenuAnchor {
+    /// The view of the window the menu opens over.
+    pub window: raw_window_handle::RawWindowHandle,
+    /// The menu's top-left corner, in the window's content coordinates.
+    pub position: Point<Pixels>,
+    /// The narrowest the menu may be, such as the width of its control.
+    pub minimum_width: Pixels,
 }
 
 /// The options that can be configured for a file dialog prompt

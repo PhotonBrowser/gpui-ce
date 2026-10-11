@@ -17,10 +17,10 @@ use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
     Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, MacActivationPolicy, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
-    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
-    PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
-    WindowParams, popup::PopupNotSupportedError,
+    KeyContext, Keymap, MacActivationPolicy, Menu, MenuAnchor, MenuItem, OsMenu, OwnedMenu,
+    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
+    PlatformTextSystem, PlatformWindow, Result, SystemMenuType, Task, ThermalState,
+    WindowAppearance, WindowKind, WindowParams, popup::PopupNotSupportedError,
 };
 use gpui_util::{ResultExt, new_std_command};
 use itertools::Itertools;
@@ -31,16 +31,18 @@ use objc2_app_kit::{
     NSAppearance, NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSControlStateValueOn, NSCursor, NSDocumentController, NSEvent, NSEventModifierFlags, NSMenu,
     NSMenuDelegate, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSResponder, NSSavePanel,
-    NSScroller, NSWorkspace,
+    NSScroller, NSView, NSWorkspace,
 };
 #[cfg(feature = "screen-capture")]
 use objc2_foundation::NSOperatingSystemVersion;
 use objc2_foundation::{
     NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSNotification, NSNotificationCenter,
-    NSNumber, NSObjectProtocol, NSProcessInfo, NSString, NSUInteger, NSURL, NSUserDefaults,
+    NSNumber, NSObjectProtocol, NSPoint, NSProcessInfo, NSString, NSUInteger, NSURL,
+    NSUserDefaults,
 };
 use parking_lot::Mutex;
 use ptr::null_mut;
+use raw_window_handle::RawWindowHandle;
 use semver::Version;
 use std::{
     cell::Cell,
@@ -1098,7 +1100,12 @@ impl Platform for MacPlatform {
         state.dock_menu = Some(new);
     }
 
-    fn show_context_menu(&self, menu: Vec<MenuItem>, keymap: &Keymap) {
+    fn show_context_menu(
+        &self,
+        menu: Vec<MenuItem>,
+        anchor: Option<MenuAnchor>,
+        keymap: &Keymap,
+    ) -> oneshot::Receiver<bool> {
         let mut state = self.0.lock();
         let app_delegate = state
             .app_delegate
@@ -1121,18 +1128,44 @@ impl Platform for MacPlatform {
         state.context_menu_actions = actions;
         let executor = state.foreground_executor.clone();
         drop(state);
+        let anchor = anchor.and_then(|anchor| {
+            let RawWindowHandle::AppKit(handle) = anchor.window else {
+                return None;
+            };
+            // SAFETY: an AppKit window handle points at the window's live NSView.
+            let view = unsafe { Retained::retain(handle.ns_view.as_ptr().cast::<NSView>()) }?;
+            context_menu.setMinimumWidth(f64::from(anchor.minimum_width));
+            Some((view, anchor.position))
+        });
+        let (chosen_tx, chosen_rx) = oneshot::channel();
         // Menu tracking runs its own event loop until the menu closes, and
         // choosing an item calls back into the app, so it opens after the
         // event that asked for it rather than inside it.
         executor
             .spawn(async move {
-                context_menu.popUpMenuPositioningItem_atLocation_inView(
-                    None,
-                    NSEvent::mouseLocation(),
-                    None,
-                );
+                let chosen = match anchor {
+                    // The view's origin is at its bottom left.
+                    Some((view, position)) => {
+                        let location = NSPoint::new(
+                            f64::from(position.x),
+                            view.bounds().size.height - f64::from(position.y),
+                        );
+                        context_menu.popUpMenuPositioningItem_atLocation_inView(
+                            None,
+                            location,
+                            Some(&view),
+                        )
+                    }
+                    None => context_menu.popUpMenuPositioningItem_atLocation_inView(
+                        None,
+                        NSEvent::mouseLocation(),
+                        None,
+                    ),
+                };
+                chosen_tx.send(chosen).ok();
             })
             .detach();
+        chosen_rx
     }
 
     fn add_recent_document(&self, path: &Path) {

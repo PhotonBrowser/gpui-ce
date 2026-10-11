@@ -2520,7 +2520,11 @@ impl App {
     /// Choosing an item dispatches its action as the menu bar does. The
     /// menu opens once the current event has been handled.
     pub fn show_context_menu(&self, menu: Vec<MenuItem>) {
-        self.platform.show_context_menu(menu, &self.keymap.borrow());
+        // The pointer's menu reports its choice through the items' actions.
+        drop(
+            self.platform
+                .show_context_menu(menu, None, &self.keymap.borrow()),
+        );
     }
 
     /// Sets the right click menu for the app icon in the dock

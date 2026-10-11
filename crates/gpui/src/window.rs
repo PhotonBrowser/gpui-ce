@@ -6,11 +6,11 @@ use crate::{
     Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
     GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IntoElement, IsZero,
     KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp,
-    LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton,
-    MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
-    PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
+    LineLayoutIndex, MenuAnchor, MenuItem, Modifiers, ModifiersChangedEvent, MonochromeSprite,
+    Motion, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
+    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
+    Priority, PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
     Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
     Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
@@ -6832,6 +6832,30 @@ impl Window {
                 window.platform_window.set_input_handler(input_handler);
             }
         });
+    }
+
+    /// Shows `menu` as a native menu with its top-left corner at `position`
+    /// in this window and at least `minimum_width` wide, as a pop-up button's
+    /// menu opens under the button. Choosing an item dispatches its action as
+    /// the menu bar does. The receiver reports whether an item was chosen
+    /// once the menu closes.
+    pub fn show_menu_at(
+        &self,
+        menu: Vec<MenuItem>,
+        position: Point<Pixels>,
+        minimum_width: Pixels,
+        cx: &App,
+    ) -> oneshot::Receiver<bool> {
+        let Ok(handle) = HasWindowHandle::window_handle(self) else {
+            return oneshot::channel().1;
+        };
+        let anchor = MenuAnchor {
+            window: handle.as_raw(),
+            position,
+            minimum_width,
+        };
+        cx.platform
+            .show_context_menu(menu, Some(anchor), &cx.keymap.borrow())
     }
 
     /// Present a platform dialog.
