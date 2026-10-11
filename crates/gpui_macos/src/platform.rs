@@ -211,6 +211,9 @@ pub(crate) struct MacPlatformState {
     /// The actions of the context menu shown last, which its items find by
     /// negative tags, apart from the menu bar's.
     context_menu_actions: Vec<Box<dyn Action>>,
+    /// The Dock menu's actions, which its items find by tags from
+    /// `DOCK_MENU_TAG_BASE`, so replacing the menu bar keeps them.
+    dock_menu_actions: Vec<Box<dyn Action>>,
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
     finish_launching: Option<Box<dyn FnOnce()>>,
     dock_menu: Option<Retained<NSMenu>>,
@@ -250,6 +253,7 @@ impl MacPlatform {
             will_open_menu: None,
             menu_actions: Default::default(),
             context_menu_actions: Default::default(),
+            dock_menu_actions: Default::default(),
             open_urls: None,
             finish_launching: None,
             dock_menu: None,
@@ -1068,7 +1072,9 @@ impl Platform for MacPlatform {
             .app_delegate
             .clone()
             .expect("app delegate not initialized");
+        // The new menu bar's items replace the old ones' actions.
         let actions = &mut state.menu_actions;
+        actions.clear();
         let menu = self.create_menu_bar(&menus, &delegate, actions, keymap);
         drop(state);
         app.as_super().setMainMenu(Some(&menu));
@@ -1085,8 +1091,10 @@ impl Platform for MacPlatform {
             .app_delegate
             .clone()
             .expect("app delegate not initialized");
-        let actions = &mut state.menu_actions;
-        let new = self.create_dock_menu(menu, &delegate, actions, keymap);
+        let mut actions = Vec::new();
+        let new = self.create_dock_menu(menu, &delegate, &mut actions, keymap);
+        offset_menu_tags(&new, DOCK_MENU_TAG_BASE);
+        state.dock_menu_actions = actions;
         state.dock_menu = Some(new);
     }
 
@@ -1502,6 +1510,9 @@ fn open_urls(this: &GPUIApplicationDelegate, native_urls: &NSArray<NSURL>) {
     }
 }
 
+/// Where the Dock menu's item tags start, above any menu bar's.
+const DOCK_MENU_TAG_BASE: NSInteger = 1 << 40;
+
 /// Gives context menu items negative tags, so their actions are found apart
 /// from the menu bar's, which use the same tags counting up from zero.
 fn mark_context_menu_items(menu: &NSMenu) {
@@ -1514,10 +1525,26 @@ fn mark_context_menu_items(menu: &NSMenu) {
     }
 }
 
-/// The action of the menu bar or context menu item with `tag`.
+/// Moves a menu's item tags up by `base`, so its actions are found apart
+/// from the menu bar's.
+fn offset_menu_tags(menu: &NSMenu, base: NSInteger) {
+    for item in menu.itemArray() {
+        if let Some(submenu) = item.submenu() {
+            offset_menu_tags(&submenu, base);
+        } else if !item.isSeparatorItem() {
+            item.setTag(item.tag() + base);
+        }
+    }
+}
+
+/// The action of the menu bar, Dock menu or context menu item with `tag`.
 fn menu_action(state: &MacPlatformState, tag: NSInteger) -> Option<Box<dyn Action>> {
     let action = if tag < 0 {
         state.context_menu_actions.get((-tag - 1) as usize)
+    } else if tag >= DOCK_MENU_TAG_BASE {
+        state
+            .dock_menu_actions
+            .get((tag - DOCK_MENU_TAG_BASE) as usize)
     } else {
         state.menu_actions.get(tag as usize)
     };
