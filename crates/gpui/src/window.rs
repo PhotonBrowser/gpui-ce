@@ -2892,6 +2892,22 @@ impl Window {
             .set_traffic_light_hover_behavior(enabled);
     }
 
+    /// Lays the macOS traffic lights out in a row, as AppKit does, or in a
+    /// column, starting from their position. Native fullscreen always uses
+    /// AppKit's layout.
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_light_axis(&self, axis: crate::Axis) {
+        self.platform_window.set_traffic_light_axis(axis);
+    }
+
+    /// Shows or hides the macOS traffic lights. Hidden controls take no
+    /// clicks, so content beneath them receives them. Native fullscreen
+    /// always shows AppKit's controls.
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_lights_visible(&self, visible: bool) {
+        self.platform_window.set_traffic_lights_visible(visible);
+    }
+
     /// Sets the application identifier.
     pub fn set_app_id(&mut self, app_id: &str) {
         self.platform_window.set_app_id(app_id);

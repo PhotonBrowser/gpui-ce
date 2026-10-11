@@ -8,7 +8,7 @@ use anyhow::Result;
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use gpui::{
-    AnyWindowHandle, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
+    AnyWindowHandle, Axis, BackgroundExecutor, Bounds, Capslock, CursorStyle, ExternalDragPayload,
     ExternalPaths, FileDropEvent, ForegroundExecutor, KeyDownEvent, Keystroke, Modifiers,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
@@ -38,15 +38,16 @@ use objc2_app_kit::{
     NSAppearanceNameDarkAqua, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep, NSBezierPath,
     NSButton as Objc2NSButton, NSColor, NSEventModifierFlags, NSEventType,
     NSRequestUserAttentionType, NSResponder, NSScreen, NSTrackingArea, NSTrackingAreaOptions,
-    NSView as Objc2NSView, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSWindow as Objc2NSWindow,
-    NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior, NSWindowOcclusionState,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
+    NSView as Objc2NSView, NSViewFrameDidChangeNotification, NSViewLayerContentsRedrawPolicy,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
+    NSWindow as Objc2NSWindow, NSWindowButton as Objc2NSWindowButton, NSWindowCollectionBehavior,
+    NSWindowOcclusionState, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWorkspace,
 };
 use objc2_foundation::{
-    NSArray, NSInteger, NSNotFound, NSNumber, NSObject, NSOperatingSystemVersion,
-    NSPoint as Objc2NSPoint, NSRange, NSRangePointer, NSRect as Objc2NSRect, NSSize, NSString,
-    NSUInteger,
+    NSArray, NSInteger, NSNotFound, NSNotificationCenter, NSNumber, NSObject,
+    NSOperatingSystemVersion, NSPoint as Objc2NSPoint, NSRange, NSRangePointer,
+    NSRect as Objc2NSRect, NSSize, NSString, NSUInteger,
 };
 use objc2_quartz_core::{CABasicAnimation, CAMediaTiming, CAMediaTimingFunction, CATransaction};
 use parking_lot::Mutex;
@@ -647,6 +648,10 @@ unsafe fn build_window_class(
             window_did_resize as unsafe extern "C" fn(_, _, _),
         );
         decl.add_method(
+            sel!(trafficLightFrameDidChange:),
+            traffic_light_frame_did_change as unsafe extern "C" fn(_, _, _),
+        );
+        decl.add_method(
             sel!(windowDidChangeOcclusionState:),
             window_did_change_occlusion_state as unsafe extern "C" fn(_, _, _),
         );
@@ -832,10 +837,10 @@ impl TrafficLightRestingView {
         ]
         .into_iter()
         .filter_map(|kind| window.standardWindowButton(kind))
-        .filter_map(|button| {
+        .map(|button| {
             // SAFETY: the button is a live standard window button on this thread.
             let parent = unsafe { button.superview() };
-            Some(self.convertRect_fromView(button.frame(), parent.as_deref()))
+            self.convertRect_fromView(button.frame(), parent.as_deref())
         })
         .collect()
     }
@@ -997,6 +1002,13 @@ struct MacWindowState {
     traffic_light_tracking_area: Option<TrafficLightTrackingArea>,
     traffic_light_resting_view: Option<TrafficLightRestingViewEntry>,
     traffic_light_hover_suspended: bool,
+    /// Whether the traffic lights sit in a row or a column.
+    traffic_light_axis: Axis,
+    /// Whether the app hid the traffic lights outside native fullscreen.
+    traffic_lights_hidden: bool,
+    /// The close button and titlebar container whose frame changes the
+    /// window observes, to put the controls back after AppKit lays them out.
+    traffic_light_frame_observed: Option<(Retained<Objc2NSButton>, Retained<Objc2NSView>)>,
     transparent_titlebar: bool,
     previous_modifiers_changed_event: Option<PlatformInput>,
     keystroke_for_do_command: Option<Keystroke>,
@@ -1069,33 +1081,106 @@ impl MacWindowState {
         let button_padding = Pixels::from(
             frames.minimize.origin.x - frames.close.origin.x - frames.close.size.width,
         );
-        let container_height = button_height + traffic_light_position.y + traffic_light_position.y;
+        self.observe_traffic_light_frames(&buttons.close, &titlebar_container);
+        let Point { x, y } = traffic_light_position;
+        // The titlebar container is not flipped, so a column counts up from
+        // the zoom button at its bottom to the close button at its top.
+        let (container_height, [close, minimize, zoom]) = match self.traffic_light_axis {
+            Axis::Horizontal => {
+                let step = button_width + button_padding;
+                (
+                    button_height + y + y,
+                    [point(x, y), point(x + step, y), point(x + step + step, y)],
+                )
+            }
+            Axis::Vertical => {
+                let step = button_height + button_padding;
+                (
+                    button_height + step + step + y + y,
+                    [point(x, y + step + step), point(x, y + step), point(x, y)],
+                )
+            }
+        };
 
         let mut titlebar_frame = titlebar_container.frame();
         titlebar_frame.size.height = container_height.to_f64();
         titlebar_frame.origin.y = (window_height - container_height).to_f64();
-
-        let minimize_x = traffic_light_position.x + button_width + button_padding;
-        let zoom_x = minimize_x + button_width + button_padding;
+        let placements = [
+            (&buttons.close, close),
+            (&buttons.minimize, minimize),
+            (&buttons.zoom, zoom),
+        ]
+        .map(|(button, origin)| {
+            (
+                button,
+                Objc2NSPoint::new(origin.x.to_f64(), origin.y.to_f64()),
+            )
+        });
+        // Already in place: setting the frames again would only make AppKit
+        // lay the titlebar out, and report the moves, once more.
+        let placed = titlebar_container.frame() == titlebar_frame
+            && placements
+                .iter()
+                .all(|(button, origin)| button.frame().origin == *origin);
+        if placed {
+            return;
+        }
 
         titlebar_container.setFrame(titlebar_frame);
-        buttons.close.setFrameOrigin(Objc2NSPoint::new(
-            traffic_light_position.x.to_f64(),
-            traffic_light_position.y.to_f64(),
-        ));
-        buttons.minimize.setFrameOrigin(Objc2NSPoint::new(
-            minimize_x.to_f64(),
-            traffic_light_position.y.to_f64(),
-        ));
-        buttons.zoom.setFrameOrigin(Objc2NSPoint::new(
-            zoom_x.to_f64(),
-            traffic_light_position.y.to_f64(),
-        ));
+        for (button, origin) in placements {
+            button.setFrameOrigin(origin);
+        }
 
         titlebar_container.updateTrackingAreas();
         buttons.close.updateTrackingAreas();
         buttons.minimize.updateTrackingAreas();
         buttons.zoom.updateTrackingAreas();
+    }
+
+    /// AppKit lays the titlebar out again on its own schedule, putting the
+    /// controls back in its default place. Watching their frames lets the
+    /// window place them again whenever that happens. AppKit can recreate
+    /// the buttons, so this follows the current ones.
+    fn observe_traffic_light_frames(
+        &mut self,
+        close: &Retained<Objc2NSButton>,
+        container: &Retained<Objc2NSView>,
+    ) {
+        let observed = self
+            .traffic_light_frame_observed
+            .as_ref()
+            .is_some_and(|(button, view)| {
+                Retained::as_ptr(button) == Retained::as_ptr(close)
+                    && Retained::as_ptr(view) == Retained::as_ptr(container)
+            });
+        if observed {
+            return;
+        }
+        let center = NSNotificationCenter::defaultCenter();
+        // SAFETY: the window outlives its observation; AppKit drops observers
+        // as they deallocate, and the selector is defined on GPUI windows.
+        unsafe {
+            let observer = &*self.native_window.cast::<objc2::runtime::AnyObject>();
+            if let Some((button, view)) = self.traffic_light_frame_observed.take() {
+                for object in [&**button as &Objc2NSView, &view] {
+                    center.removeObserver_name_object(
+                        observer,
+                        Some(NSViewFrameDidChangeNotification),
+                        Some(object),
+                    );
+                }
+            }
+            for object in [&***close as &Objc2NSView, container] {
+                object.setPostsFrameChangedNotifications(true);
+                center.addObserver_selector_name_object(
+                    observer,
+                    sel!(trafficLightFrameDidChange:),
+                    Some(NSViewFrameDidChangeNotification),
+                    Some(object),
+                );
+            }
+        }
+        self.traffic_light_frame_observed = Some((close.clone(), container.clone()));
     }
 
     fn capture_traffic_light_frames(&self) -> Option<TrafficLightFrames> {
@@ -1134,6 +1219,16 @@ impl MacWindowState {
             return;
         };
 
+        let hidden = self.traffic_lights_hidden && !self.is_fullscreen();
+        // Controls coming back fade in from where hiding left them.
+        let unhiding = !hidden && buttons.close.isHidden();
+        self.set_traffic_lights_hidden_now(&buttons, hidden);
+        if hidden {
+            self.remove_traffic_light_tracking_area();
+            self.traffic_light_hovered = false;
+            return;
+        }
+
         if !self.traffic_light_hover_behavior
             || self.traffic_light_hover_suspended
             || self.is_fullscreen()
@@ -1143,7 +1238,7 @@ impl MacWindowState {
             if !self.traffic_light_hover_behavior {
                 self.remove_traffic_light_resting_view();
             }
-            self.set_traffic_light_visibility(&buttons, true, false);
+            self.set_traffic_light_visibility(&buttons, true, unhiding);
             return;
         }
 
@@ -1178,7 +1273,7 @@ impl MacWindowState {
             return;
         };
 
-        let animate = self.traffic_light_tracking_area.is_some();
+        let animate = unhiding || self.traffic_light_tracking_area.is_some();
         self.ensure_traffic_light_resting_view(&buttons, button_container);
         self.ensure_traffic_light_tracking_area(&buttons, tracking_container);
         self.set_traffic_light_visibility(&buttons, self.traffic_light_hovered, animate);
@@ -1218,6 +1313,43 @@ impl MacWindowState {
             Some(&buttons.close),
         );
         self.traffic_light_resting_view = Some(TrafficLightRestingViewEntry { container, view });
+    }
+
+    /// Hides or shows the controls and their resting circles at once. Hidden
+    /// views take no clicks, and they rest transparent so that showing them
+    /// again fades them in.
+    fn set_traffic_lights_hidden_now(&self, buttons: &TrafficLightButtons, hidden: bool) {
+        let controls: [&Objc2NSView; 3] = [&buttons.close, &buttons.minimize, &buttons.zoom];
+        let resting = self
+            .traffic_light_resting_view
+            .as_ref()
+            .map(|entry| -> &Objc2NSView { &entry.view });
+        for view in controls.into_iter().chain(resting) {
+            if view.isHidden() == hidden {
+                continue;
+            }
+            if hidden {
+                fade_traffic_light_view(view, 0.0, 0.0);
+            }
+            view.setHidden(hidden);
+        }
+    }
+
+    fn set_traffic_lights_hidden(&mut self, hidden: bool) {
+        if self.traffic_lights_hidden == hidden {
+            return;
+        }
+        self.traffic_lights_hidden = hidden;
+        // AppKit may have laid the hidden controls out again meanwhile.
+        self.move_traffic_light();
+    }
+
+    fn set_traffic_light_axis(&mut self, axis: Axis) {
+        if self.traffic_light_axis == axis {
+            return;
+        }
+        self.traffic_light_axis = axis;
+        self.move_traffic_light();
     }
 
     fn remove_traffic_light_resting_view(&mut self) {
@@ -1707,6 +1839,9 @@ impl MacWindow {
                 traffic_light_tracking_area: None,
                 traffic_light_resting_view: None,
                 traffic_light_hover_suspended: false,
+                traffic_light_axis: Axis::Horizontal,
+                traffic_lights_hidden: false,
+                traffic_light_frame_observed: None,
                 transparent_titlebar: titlebar
                     .as_ref()
                     .is_none_or(|titlebar| titlebar.appears_transparent),
@@ -2082,6 +2217,14 @@ impl PlatformWindow for MacWindow {
 
     fn set_traffic_light_hover_behavior(&self, enabled: bool) {
         self.0.lock().set_traffic_light_hover_behavior(enabled);
+    }
+
+    fn set_traffic_light_axis(&self, axis: Axis) {
+        self.0.lock().set_traffic_light_axis(axis);
+    }
+
+    fn set_traffic_lights_visible(&self, visible: bool) {
+        self.0.lock().set_traffic_lights_hidden(!visible);
     }
 
     fn scale_factor(&self) -> f32 {
@@ -3526,6 +3669,38 @@ unsafe extern "C" fn window_did_change_occlusion_state(this: &Objc2Object, _: Se
         } else {
             lock.stop_display_link();
         }
+    }
+}
+
+/// AppKit moved a traffic light or their container. It reports moves at
+/// once, sometimes while the window state is locked, as when the window is
+/// placing or showing the controls itself; the controls are then placed
+/// again on the next pass of the run loop, once the lock is free. Placing
+/// controls that are already in place does nothing, so this settles.
+unsafe extern "C" fn traffic_light_frame_did_change(this: &Objc2Object, _: Sel, _: ObjcId) {
+    let window_state = unsafe { get_window_state(this) };
+    let Some(mut state) = window_state.try_lock() else {
+        let selector = sel!(trafficLightFrameDidChange:);
+        // SAFETY: `this` is a live GPUI window on the main thread, and the
+        // selector is one of its own methods, taking an ignored argument.
+        unsafe {
+            let _: () = msg_send![
+                class!(NSObject),
+                cancelPreviousPerformRequestsWithTarget: this,
+                selector: selector,
+                object: NIL
+            ];
+            let _: () = msg_send![
+                this,
+                performSelector: selector,
+                withObject: NIL,
+                afterDelay: 0.0f64
+            ];
+        }
+        return;
+    };
+    if !state.traffic_light_hover_suspended && !state.is_fullscreen() {
+        state.position_traffic_light();
     }
 }
 

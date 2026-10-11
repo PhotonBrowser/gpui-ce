@@ -959,6 +959,13 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// enters or leaves their control cluster.
     #[cfg(target_os = "macos")]
     fn set_traffic_light_hover_behavior(&self, _enabled: bool) {}
+    /// Lays the macOS traffic lights out in a row or a column from their
+    /// position.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_light_axis(&self, _axis: crate::Axis) {}
+    /// Shows or hides the macOS traffic lights outside native fullscreen.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_lights_visible(&self, _visible: bool) {}
     /// Show the platform character palette.
     ///
     /// The default implementation logs a warning when the backend does not
