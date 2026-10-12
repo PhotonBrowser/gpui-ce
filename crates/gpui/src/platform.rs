@@ -982,6 +982,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     #[cfg(target_os = "macos")]
     fn set_traffic_light_position(&self, _position: Point<Pixels>) {}
+    /// Offsets the macOS traffic lights from their configured position.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_light_offset(&self, _offset: Point<Pixels>) {}
     /// Enables or disables macOS traffic lights as a group when the pointer
     /// enters or leaves their control cluster.
     #[cfg(target_os = "macos")]
@@ -993,6 +996,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Shows or hides the macOS traffic lights outside native fullscreen.
     #[cfg(target_os = "macos")]
     fn set_traffic_lights_visible(&self, _visible: bool) {}
+    /// Sets fade durations for macOS traffic lights, in milliseconds.
+    #[cfg(target_os = "macos")]
+    fn set_traffic_light_fade_durations(&self, _fade_in_ms: u16, _fade_out_ms: u16) {}
     /// Show the platform character palette.
     ///
     /// The default implementation logs a warning when the backend does not

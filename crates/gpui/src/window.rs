@@ -2932,6 +2932,12 @@ impl Window {
         self.platform_window.set_traffic_light_position(position);
     }
 
+    /// Offsets the macOS traffic lights from their configured position.
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_light_offset(&self, offset: Point<Pixels>) {
+        self.platform_window.set_traffic_light_offset(offset);
+    }
+
     /// Uses the disabled appearance for macOS traffic lights outside their
     /// control cluster and enables them on hover. Set to `false` to leave
     /// their enabled state to AppKit. Native fullscreen always uses AppKit's
@@ -2956,6 +2962,13 @@ impl Window {
     #[cfg(target_os = "macos")]
     pub fn set_traffic_lights_visible(&self, visible: bool) {
         self.platform_window.set_traffic_lights_visible(visible);
+    }
+
+    /// Sets fade durations for the macOS traffic lights, in milliseconds.
+    #[cfg(target_os = "macos")]
+    pub fn set_traffic_light_fade_durations(&self, fade_in_ms: u16, fade_out_ms: u16) {
+        self.platform_window
+            .set_traffic_light_fade_durations(fade_in_ms, fade_out_ms);
     }
 
     /// Sets the application identifier.

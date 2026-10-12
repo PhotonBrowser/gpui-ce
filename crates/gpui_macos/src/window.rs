@@ -74,8 +74,6 @@ const TRAFFIC_LIGHT_HOVER_PADDING: f64 = 8.0;
 // Calibrated to the muted discs AppKit shows for an inactive window.
 const TRAFFIC_LIGHT_REST_OPACITY_DARK: f64 = 0.17;
 const TRAFFIC_LIGHT_REST_OPACITY_LIGHT: f64 = 0.13;
-const TRAFFIC_LIGHT_HOVER_FADE_SECONDS: f64 = 0.14;
-const TRAFFIC_LIGHT_REST_FADE_SECONDS: f64 = 0.24;
 
 unsafe fn set_window_state_ivar(object: ObjcId, state: *mut c_void) {
     let object = unsafe { &mut *object };
@@ -996,6 +994,7 @@ struct MacWindowState {
     last_left_mouse_down_event: Option<Retained<Objc2Object>>,
     synthetic_drag_counter: usize,
     traffic_light_position: Option<Point<Pixels>>,
+    traffic_light_offset: Point<Pixels>,
     traffic_light_frames: Option<TrafficLightFrames>,
     traffic_light_hover_behavior: bool,
     traffic_light_hovered: bool,
@@ -1006,6 +1005,9 @@ struct MacWindowState {
     traffic_light_axis: Axis,
     /// Whether the app hid the traffic lights outside native fullscreen.
     traffic_lights_hidden: bool,
+    traffic_lights_faded_out: bool,
+    traffic_light_fade_in_ms: u16,
+    traffic_light_fade_out_ms: u16,
     /// The close button and titlebar container whose frame changes the
     /// window observes, to put the controls back after AppKit lays them out.
     traffic_light_frame_observed: Option<(Retained<Objc2NSButton>, Retained<Objc2NSView>)>,
@@ -1113,7 +1115,10 @@ impl MacWindowState {
         .map(|(button, origin)| {
             (
                 button,
-                Objc2NSPoint::new(origin.x.to_f64(), origin.y.to_f64()),
+                Objc2NSPoint::new(
+                    origin.x.to_f64() + self.traffic_light_offset.x.to_f64(),
+                    origin.y.to_f64() + self.traffic_light_offset.y.to_f64(),
+                ),
             )
         });
         // Already in place: setting the frames again would only make AppKit
@@ -1123,6 +1128,8 @@ impl MacWindowState {
                 .iter()
                 .all(|(button, origin)| button.frame().origin == *origin);
         if placed {
+            self.invalidate_traffic_light_resting_view();
+            self.update_traffic_light_tracking_area_for_position(&buttons, titlebar_container);
             return;
         }
 
@@ -1135,6 +1142,34 @@ impl MacWindowState {
         buttons.close.updateTrackingAreas();
         buttons.minimize.updateTrackingAreas();
         buttons.zoom.updateTrackingAreas();
+        self.invalidate_traffic_light_resting_view();
+        self.update_traffic_light_tracking_area_for_position(&buttons, titlebar_container);
+    }
+
+    fn invalidate_traffic_light_resting_view(&self) {
+        if let Some(entry) = self.traffic_light_resting_view.as_ref() {
+            entry.view.setNeedsDisplay(true);
+        }
+    }
+
+    fn update_traffic_light_tracking_area_for_position(
+        &mut self,
+        buttons: &TrafficLightButtons,
+        container: Retained<Objc2NSView>,
+    ) {
+        if self.traffic_light_tracking_area.is_none()
+            || self.traffic_lights_hidden
+            || self.traffic_light_hover_suspended
+            || self.is_fullscreen()
+        {
+            return;
+        }
+
+        let was_hovered = self.traffic_light_hovered;
+        self.ensure_traffic_light_tracking_area(buttons, container);
+        if was_hovered != self.traffic_light_hovered {
+            self.set_traffic_light_visibility(buttons, self.traffic_light_hovered, true);
+        }
     }
 
     /// AppKit lays the titlebar out again on its own schedule, putting the
@@ -1221,8 +1256,9 @@ impl MacWindowState {
 
         let hidden = self.traffic_lights_hidden && !self.is_fullscreen();
         // Controls coming back fade in from where hiding left them.
-        let unhiding = !hidden && buttons.close.isHidden();
-        self.set_traffic_lights_hidden_now(&buttons, hidden);
+        let unhiding = !hidden && self.traffic_lights_faded_out;
+        let visibility_changed = hidden != self.traffic_lights_faded_out;
+        self.set_traffic_lights_hidden_now(&buttons, hidden, visibility_changed);
         if hidden {
             self.remove_traffic_light_tracking_area();
             self.traffic_light_hovered = false;
@@ -1315,24 +1351,41 @@ impl MacWindowState {
         self.traffic_light_resting_view = Some(TrafficLightRestingViewEntry { container, view });
     }
 
-    /// Hides or shows the controls and their resting circles at once. Hidden
-    /// views take no clicks, and they rest transparent so that showing them
-    /// again fades them in.
-    fn set_traffic_lights_hidden_now(&self, buttons: &TrafficLightButtons, hidden: bool) {
-        let controls: [&Objc2NSView; 3] = [&buttons.close, &buttons.minimize, &buttons.zoom];
+    /// Fades the controls and their resting circles when the sidebar hides
+    /// them. Disabled controls take no clicks while they fade away.
+    fn set_traffic_lights_hidden_now(
+        &mut self,
+        buttons: &TrafficLightButtons,
+        hidden: bool,
+        animate: bool,
+    ) {
         let resting = self
             .traffic_light_resting_view
             .as_ref()
             .map(|entry| -> &Objc2NSView { &entry.view });
-        for view in controls.into_iter().chain(resting) {
-            if view.isHidden() == hidden {
-                continue;
-            }
+        let duration = if animate
+            && !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion()
+        {
             if hidden {
-                fade_traffic_light_view(view, 0.0, 0.0);
+                self.traffic_light_fade_out_ms
+            } else {
+                self.traffic_light_fade_in_ms
             }
-            view.setHidden(hidden);
+        } else {
+            0
+        };
+        for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
+            button.setEnabled(!hidden);
+            fade_traffic_light_view(
+                button,
+                if hidden { 0.0 } else { 1.0 },
+                f64::from(duration) / 1000.0,
+            );
         }
+        if let Some(resting) = resting {
+            fade_traffic_light_view(resting, 0.0, f64::from(duration) / 1000.0);
+        }
+        self.traffic_lights_faded_out = hidden;
     }
 
     fn set_traffic_lights_hidden(&mut self, hidden: bool) {
@@ -1365,10 +1418,12 @@ impl MacWindowState {
         animate: bool,
     ) {
         let reduce_motion = NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-        let duration = match (animate && !reduce_motion, visible) {
-            (false, _) => 0.0,
-            (true, true) => TRAFFIC_LIGHT_HOVER_FADE_SECONDS,
-            (true, false) => TRAFFIC_LIGHT_REST_FADE_SECONDS,
+        let duration = if !animate || reduce_motion {
+            0.0
+        } else if visible {
+            f64::from(self.traffic_light_fade_in_ms) / 1000.0
+        } else {
+            f64::from(self.traffic_light_fade_out_ms) / 1000.0
         };
         let button_opacity = if visible { 1.0 } else { 0.0 };
         for button in [&buttons.close, &buttons.minimize, &buttons.zoom] {
@@ -1833,6 +1888,7 @@ impl MacWindow {
                 traffic_light_position: titlebar
                     .as_ref()
                     .and_then(|titlebar| titlebar.traffic_light_position),
+                traffic_light_offset: point(px(0.0), px(0.0)),
                 traffic_light_frames: None,
                 traffic_light_hover_behavior: false,
                 traffic_light_hovered: false,
@@ -1841,6 +1897,9 @@ impl MacWindow {
                 traffic_light_hover_suspended: false,
                 traffic_light_axis: Axis::Horizontal,
                 traffic_lights_hidden: false,
+                traffic_lights_faded_out: false,
+                traffic_light_fade_in_ms: 140,
+                traffic_light_fade_out_ms: 240,
                 traffic_light_frame_observed: None,
                 transparent_titlebar: titlebar
                     .as_ref()
@@ -2215,6 +2274,18 @@ impl PlatformWindow for MacWindow {
         state.move_traffic_light();
     }
 
+    fn set_traffic_light_offset(&self, offset: Point<Pixels>) {
+        let mut state = self.0.lock();
+        if state.traffic_light_offset == offset {
+            return;
+        }
+        state.traffic_light_offset = offset;
+        // This is a per-frame offset driven by the sidebar's own tween. Only
+        // update frames here; rerunning the hover/visibility path would restart
+        // the opacity transition on every sidebar frame.
+        state.position_traffic_light();
+    }
+
     fn set_traffic_light_hover_behavior(&self, enabled: bool) {
         self.0.lock().set_traffic_light_hover_behavior(enabled);
     }
@@ -2225,6 +2296,19 @@ impl PlatformWindow for MacWindow {
 
     fn set_traffic_lights_visible(&self, visible: bool) {
         self.0.lock().set_traffic_lights_hidden(!visible);
+    }
+
+    fn set_traffic_light_fade_durations(&self, fade_in_ms: u16, fade_out_ms: u16) {
+        let mut state = self.0.lock();
+        let fade_in_ms = fade_in_ms.min(2_000);
+        let fade_out_ms = fade_out_ms.min(2_000);
+        if state.traffic_light_fade_in_ms == fade_in_ms
+            && state.traffic_light_fade_out_ms == fade_out_ms
+        {
+            return;
+        }
+        state.traffic_light_fade_in_ms = fade_in_ms;
+        state.traffic_light_fade_out_ms = fade_out_ms;
     }
 
     fn scale_factor(&self) -> f32 {
