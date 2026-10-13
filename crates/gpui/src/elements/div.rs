@@ -55,6 +55,10 @@ use std::{
 use super::ImageCacheProvider;
 use super::elastic_scroll::ElasticScroll;
 
+fn scroll_axis_has_range(overflow: Overflow, max_offset: Pixels) -> bool {
+    overflow == Overflow::Scroll && max_offset > px(0.)
+}
+
 mod inline;
 pub(crate) use inline::InlineContent;
 use inline::InlineDivFrameState;
@@ -3156,7 +3160,9 @@ impl Interactivity {
             if let Some(elastic_state) = self.elastic_state.as_ref() {
                 let mut elastic_state = elastic_state.borrow_mut();
                 elastic_state.set_scrollport_size(bounds.size.into());
-                if cx.reduce_motion() {
+                let has_scroll_range = scroll_axis_has_range(style.overflow.x, scroll_max.x)
+                    || scroll_axis_has_range(style.overflow.y, scroll_max.y);
+                if cx.reduce_motion() || !has_scroll_range {
                     elastic_state.clear();
                 } else {
                     if elastic_state.advance_rebound_to(Instant::now()) {
@@ -4038,7 +4044,15 @@ impl Interactivity {
 
                     let gesture_delta = delta;
                     let now = Instant::now();
+                    let max_offset = max_scroll_offset
+                        .as_ref()
+                        .map(|max_offset| *max_offset.borrow())
+                        .unwrap_or_default();
+                    let can_scroll_x = scroll_axis_has_range(overflow.x, max_offset.x);
+                    let can_scroll_y = scroll_axis_has_range(overflow.y, max_offset.y);
+                    let has_scroll_range = can_scroll_x || can_scroll_y;
                     let can_elastic_scroll = elastic_enabled
+                        && has_scroll_range
                         && event.delta.precise()
                         && (event.has_native_phase || event.is_momentum);
                     let mut elastic_velocity = None;
@@ -4047,7 +4061,7 @@ impl Interactivity {
                     if let Some(elastic_state) = elastic_state.as_ref() {
                         let mut state = elastic_state.borrow_mut();
                         previous_stretch = state.stretch();
-                        if !elastic_enabled || cx.reduce_motion() {
+                        if !elastic_enabled || !has_scroll_range || cx.reduce_motion() {
                             state.clear();
                         } else if can_elastic_scroll {
                             let gesture_ended = matches!(
@@ -4094,10 +4108,6 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    let max_offset = max_scroll_offset
-                        .as_ref()
-                        .map(|max_offset| *max_offset.borrow())
-                        .unwrap_or_default();
                     let attempted_offset =
                         point(scroll_offset.x + delta_x, scroll_offset.y + delta_y);
                     let clamped_offset = point(
@@ -4113,10 +4123,9 @@ impl Interactivity {
                         && let Some(elastic_state) = elastic_state.as_ref()
                     {
                         let vertical_is_main_axis = gesture_delta.y.abs() >= gesture_delta.x.abs();
-                        let overscroll = if vertical_is_main_axis && overflow.y == Overflow::Scroll
-                        {
+                        let overscroll = if vertical_is_main_axis && can_scroll_y {
                             point(Pixels::ZERO, unconsumed.y)
-                        } else if !vertical_is_main_axis && overflow.x == Overflow::Scroll {
+                        } else if !vertical_is_main_axis && can_scroll_x {
                             point(unconsumed.x, Pixels::ZERO)
                         } else {
                             Point::default()
@@ -6656,6 +6665,70 @@ mod tests {
             .unwrap();
 
         assert_eq!(scroll_handle.max_offset().y, px(0.));
+    }
+
+    #[gpui::test]
+    fn elastic_scroll_only_stretches_when_content_overflows(cx: &mut TestAppContext) {
+        use crate::{ScrollDelta, ScrollWheelEvent};
+
+        struct ElasticScrollView(Pixels);
+
+        impl Render for ElasticScrollView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(
+                    div()
+                        .id("elastic-scroll-container")
+                        .w(px(100.))
+                        .h(px(100.))
+                        .overflow_y_scroll()
+                        .elastic_scroll(true)
+                        .child(
+                            div()
+                                .debug_selector(|| "elastic-scroll-content".to_string())
+                                .w_full()
+                                .h(self.0),
+                        ),
+                )
+            }
+        }
+
+        fn overscroll(window: &mut crate::app::VisualTestContext) {
+            window.simulate_event(ScrollWheelEvent {
+                position: point(px(20.), px(20.)),
+                delta: ScrollDelta::Pixels(point(px(0.), px(20.))),
+                touch_phase: crate::TouchPhase::Moved,
+                has_native_phase: true,
+                ..Default::default()
+            });
+        }
+
+        let (_, window) = cx.add_window_view(|_, _| ElasticScrollView(px(80.)));
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        let fitting_content = window.debug_bounds("elastic-scroll-content").unwrap();
+        overscroll(window);
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        assert_eq!(
+            window
+                .debug_bounds("elastic-scroll-content")
+                .unwrap()
+                .origin
+                .y,
+            fitting_content.origin.y,
+        );
+
+        let (_, window) = cx.add_window_view(|_, _| ElasticScrollView(px(180.)));
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        let overflowing_content = window.debug_bounds("elastic-scroll-content").unwrap();
+        overscroll(window);
+        window.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(
+            window
+                .debug_bounds("elastic-scroll-content")
+                .unwrap()
+                .origin
+                .y
+                > overflowing_content.origin.y,
+        );
     }
 
     struct ContentSizedGrid;
