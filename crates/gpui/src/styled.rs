@@ -972,6 +972,18 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Uniformly scales this element's painted contents around its center without changing layout.
+    fn scale(self, scale: f32) -> Self {
+        self.scale_xy(scale, scale)
+    }
+
+    /// Scales this element's painted contents independently on each axis without changing layout.
+    fn scale_xy(mut self, x: f32, y: f32) -> Self {
+        self.style().scale.width = Some(x);
+        self.style().scale.height = Some(y);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {
