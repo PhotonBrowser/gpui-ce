@@ -7,6 +7,8 @@ use std::{collections::VecDeque, time::Instant};
 
 use crate::{Pixels, Point};
 
+/// Scales the rendered stretch; lower values make edge overscroll gentler.
+const ELASTIC_SCROLL_INTENSITY: f32 = 0.8;
 const RUBBER_BAND_STIFFNESS: f32 = 12.0;
 const RUBBER_BAND_AMPLITUDE: f32 = 0.31;
 const RUBBER_BAND_PERIOD: f64 = 1.2;
@@ -84,6 +86,7 @@ impl ElasticScroll {
                 },
                 |rebound| rebound.current_stretch,
             )
+            .scaled(ELASTIC_SCROLL_INTENSITY)
             .to_point()
     }
 
@@ -356,13 +359,14 @@ mod tests {
     }
 
     #[test]
-    fn stretch_matches_engine_curve_and_retains_subpixels() {
+    fn stretch_uses_engine_curve_at_configured_intensity() {
         let mut scroll = ElasticScroll::default();
         scroll.set_scrollport_size(viewport());
         scroll.pull_by(Point::new(px(0.0), px(-19.0)));
-        assert!((f32::from(scroll.stretch().y) + 19.0 / 12.0).abs() < 0.001);
+        let expected_scale = ELASTIC_SCROLL_INTENSITY / RUBBER_BAND_STIFFNESS;
+        assert!((f32::from(scroll.stretch().y) + 19.0 * expected_scale).abs() < 0.001);
         scroll.pull_by(Point::new(px(0.0), px(-381.0)));
-        assert!((f32::from(scroll.stretch().y) + 400.0 / 12.0).abs() < 0.001);
+        assert!((f32::from(scroll.stretch().y) + 400.0 * expected_scale).abs() < 0.001);
     }
 
     #[test]
@@ -442,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn release_velocity_is_limited_to_a_share_of_the_viewport() {
+    fn release_velocity_is_limited_to_a_configured_share_of_the_viewport() {
         let mut scroll = ElasticScroll::default();
         scroll.set_scrollport_size(viewport());
         scroll.pull_by(Point::new(px(0.0), px(4.0)));
@@ -456,6 +460,9 @@ mod tests {
             furthest = furthest.max(f32::from(scroll.stretch().y));
         }
         assert!(furthest > 60.0);
-        assert!(furthest <= 600.0 * LARGEST_BOUNCE_AS_SHARE_OF_SCROLLPORT + 1.0);
+        assert!(
+            furthest
+                <= 600.0 * LARGEST_BOUNCE_AS_SHARE_OF_SCROLLPORT * ELASTIC_SCROLL_INTENSITY + 1.0
+        );
     }
 }
