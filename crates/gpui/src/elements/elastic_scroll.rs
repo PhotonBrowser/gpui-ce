@@ -158,6 +158,19 @@ impl ElasticScroll {
         true
     }
 
+    /// Release a stretch when momentum begins, keeping velocity samples if the
+    /// scroll has not reached an edge yet.
+    pub(crate) fn release_if_stretched(
+        &mut self,
+        velocity: Option<Point<Pixels>>,
+        now: Instant,
+    ) -> bool {
+        if self.rebound.is_some() || self.accumulated_overscroll.is_zero() {
+            return false;
+        }
+        self.release(velocity, now)
+    }
+
     /// Advances the rebound to an absolute frame time. Absolute sampling keeps
     /// the curve stable across missed frames and different refresh rates.
     pub(crate) fn advance_rebound_to(&mut self, frame_time: Instant) -> bool {
@@ -443,6 +456,24 @@ mod tests {
         let velocity = scroll.velocity_at_lift(after(start, 30)).unwrap();
         assert!(f32::from(velocity.y + px(1_000.0)).abs() < 0.1);
         assert!(scroll.velocity_at_lift(after(start, 121)).is_none());
+    }
+
+    #[test]
+    fn momentum_without_stretch_keeps_velocity_for_an_edge_bounce() {
+        let mut scroll = ElasticScroll::default();
+        scroll.set_scrollport_size(viewport());
+        let start = Instant::now();
+        for milliseconds in [0, 10, 20] {
+            scroll.add_step(Point::new(px(0.0), px(-10.0)), after(start, milliseconds));
+        }
+
+        assert!(!scroll.release_if_stretched(None, after(start, 20)));
+        let velocity = scroll.velocity_at_lift(after(start, 30)).unwrap();
+        scroll.pull_by(Point::new(px(0.0), px(-24.0)));
+        assert!(scroll.release(Some(velocity), after(start, 30)));
+
+        let rebound = scroll.rebound.unwrap();
+        assert!((rebound.initial_velocity.y + 1_000.0).abs() < 0.1);
     }
 
     #[test]

@@ -4109,7 +4109,7 @@ impl Interactivity {
                             }
                             elastic_velocity = state.velocity_at_lift(now);
                             if event.is_momentum {
-                                start_rebound |= state.release(elastic_velocity, now);
+                                start_rebound |= state.release_if_stretched(elastic_velocity, now);
                             } else if !gesture_ended {
                                 delta = state.relax_by(delta);
                             }
