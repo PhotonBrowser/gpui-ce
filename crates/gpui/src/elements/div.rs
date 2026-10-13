@@ -49,10 +49,11 @@ use std::{
     mem,
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use super::ImageCacheProvider;
+use super::elastic_scroll::ElasticScroll;
 
 mod inline;
 pub(crate) use inline::InlineContent;
@@ -1807,6 +1808,15 @@ pub trait StatefulInteractiveElement: InteractiveElement {
         self
     }
 
+    /// Enable elastic overscroll when this container reaches its edge.
+    ///
+    /// Elasticity is applied only to precise, phased scroll gestures, such as
+    /// macOS trackpad input. Discrete wheel events keep their normal behavior.
+    fn elastic_scroll(mut self, enabled: bool) -> Self {
+        self.interactivity().elastic_scroll = enabled;
+        self
+    }
+
     /// Restrict scrolling of this element to the axis of the input gesture.
     ///
     /// See [`Style::restrict_scroll_to_axis`](crate::Style::restrict_scroll_to_axis) for details.
@@ -2722,7 +2732,10 @@ pub struct Interactivity {
     pub(crate) tracked_scroll_handle: Option<ScrollHandle>,
     pub(crate) scroll_anchor: Option<ScrollAnchor>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    pub(crate) max_scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     pub(crate) ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    pub(crate) elastic_scroll: bool,
+    pub(crate) elastic_state: Option<Rc<RefCell<ElasticScroll>>>,
     pub(crate) group: Option<SharedString>,
     /// The base style of the element, before any modifications are applied
     /// by focus, active, etc.
@@ -2877,7 +2890,13 @@ impl Interactivity {
                 if let Some(scroll_handle) = self.tracked_scroll_handle.as_ref() {
                     let scroll_handle_state = scroll_handle.0.borrow();
                     self.scroll_offset = Some(scroll_handle_state.offset.clone());
+                    self.max_scroll_offset = Some(scroll_handle_state.max_offset.clone());
                     self.ongoing_scroll = Some(scroll_handle_state.ongoing_scroll.clone());
+                    if self.elastic_scroll {
+                        self.elastic_state = Some(scroll_handle_state.elastic_state.clone());
+                    } else {
+                        scroll_handle_state.elastic_state.borrow_mut().clear();
+                    }
                 } else if (self.base_style.overflow.x == Some(Overflow::Scroll)
                     || self.base_style.overflow.y == Some(Overflow::Scroll))
                     && let Some(element_state) = element_state.as_mut()
@@ -2894,6 +2913,24 @@ impl Interactivity {
                             .get_or_insert_with(|| Rc::new(RefCell::new(OngoingScroll::default())))
                             .clone(),
                     );
+                    self.max_scroll_offset = Some(
+                        element_state
+                            .max_scroll_offset
+                            .get_or_insert_with(Rc::default)
+                            .clone(),
+                    );
+                    if self.elastic_scroll {
+                        self.elastic_state = Some(
+                            element_state
+                                .elastic_state
+                                .get_or_insert_with(|| {
+                                    Rc::new(RefCell::new(ElasticScroll::default()))
+                                })
+                                .clone(),
+                        );
+                    } else if let Some(elastic_state) = element_state.elastic_state.as_ref() {
+                        elastic_state.borrow_mut().clear();
+                    }
                 }
 
                 let style =
@@ -3058,7 +3095,7 @@ impl Interactivity {
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Point<Pixels> {
         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
             const ROUNDING_FACTOR: f32 = 100.0;
@@ -3108,11 +3145,30 @@ impl Interactivity {
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
-                scroll_handle_state.max_offset = scroll_max;
+                *scroll_handle_state.max_offset.borrow_mut() = scroll_max;
                 scroll_handle_state.bounds = bounds;
             }
+            if let Some(max_scroll_offset) = self.max_scroll_offset.as_ref() {
+                *max_scroll_offset.borrow_mut() = scroll_max;
+            }
 
-            *scroll_offset
+            let mut paint_offset = *scroll_offset;
+            if let Some(elastic_state) = self.elastic_state.as_ref() {
+                let mut elastic_state = elastic_state.borrow_mut();
+                elastic_state.set_scrollport_size(bounds.size.into());
+                if cx.reduce_motion() {
+                    elastic_state.clear();
+                } else {
+                    if elastic_state.advance_rebound_to(Instant::now()) {
+                        window.request_animation_frame();
+                    }
+                    let stretch = elastic_state.stretch();
+                    paint_offset.x += stretch.x;
+                    paint_offset.y += stretch.y;
+                }
+            }
+
+            paint_offset
         } else {
             Point::default()
         }
@@ -3955,6 +4011,9 @@ impl Interactivity {
         _cx: &mut App,
     ) {
         if let Some(scroll_offset) = self.scroll_offset.clone() {
+            let elastic_enabled = self.elastic_scroll;
+            let elastic_state = self.elastic_state.clone();
+            let max_scroll_offset = self.max_scroll_offset.clone();
             let ongoing_scroll = self.ongoing_scroll.clone();
             let overflow = style.overflow;
             let allow_concurrent_scroll = style.allow_concurrent_scroll;
@@ -3975,6 +4034,39 @@ impl Interactivity {
                         ongoing_scroll
                             .borrow_mut()
                             .filter(&mut delta, event.touch_phase);
+                    }
+
+                    let gesture_delta = delta;
+                    let now = Instant::now();
+                    let can_elastic_scroll = elastic_enabled
+                        && event.delta.precise()
+                        && (event.has_native_phase || event.is_momentum);
+                    let mut elastic_velocity = None;
+                    let mut start_rebound = false;
+                    let mut previous_stretch = Point::default();
+                    if let Some(elastic_state) = elastic_state.as_ref() {
+                        let mut state = elastic_state.borrow_mut();
+                        previous_stretch = state.stretch();
+                        if !elastic_enabled || cx.reduce_motion() {
+                            state.clear();
+                        } else if can_elastic_scroll {
+                            let gesture_ended = matches!(
+                                event.touch_phase,
+                                crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
+                            );
+                            if event.is_momentum
+                                || (!gesture_ended
+                                    && event.touch_phase != crate::TouchPhase::Started)
+                            {
+                                state.add_step(gesture_delta, now);
+                            }
+                            elastic_velocity = state.velocity_at_lift(now);
+                            if event.is_momentum {
+                                start_rebound |= state.release(elastic_velocity, now);
+                            } else if !gesture_ended {
+                                delta = state.relax_by(delta);
+                            }
+                        }
                     }
 
                     let mut delta_x = match overflow.x {
@@ -4002,9 +4094,57 @@ impl Interactivity {
                             delta_x = Pixels::ZERO;
                         }
                     }
-                    scroll_offset.y += delta_y;
-                    scroll_offset.x += delta_x;
-                    if *scroll_offset != old_scroll_offset {
+                    let max_offset = max_scroll_offset
+                        .as_ref()
+                        .map(|max_offset| *max_offset.borrow())
+                        .unwrap_or_default();
+                    let attempted_offset =
+                        point(scroll_offset.x + delta_x, scroll_offset.y + delta_y);
+                    let clamped_offset = point(
+                        attempted_offset.x.clamp(-max_offset.x, px(0.)),
+                        attempted_offset.y.clamp(-max_offset.y, px(0.)),
+                    );
+                    let unconsumed = attempted_offset - clamped_offset;
+                    *scroll_offset = clamped_offset;
+
+                    let mut elastic_changed = false;
+                    if can_elastic_scroll
+                        && !cx.reduce_motion()
+                        && let Some(elastic_state) = elastic_state.as_ref()
+                    {
+                        let vertical_is_main_axis = gesture_delta.y.abs() >= gesture_delta.x.abs();
+                        let overscroll = if vertical_is_main_axis && overflow.y == Overflow::Scroll
+                        {
+                            point(Pixels::ZERO, unconsumed.y)
+                        } else if !vertical_is_main_axis && overflow.x == Overflow::Scroll {
+                            point(unconsumed.x, Pixels::ZERO)
+                        } else {
+                            Point::default()
+                        };
+                        let mut state = elastic_state.borrow_mut();
+                        if !overscroll.x.is_zero() || !overscroll.y.is_zero() {
+                            // An elastic container consumes the edge delta so a parent does not
+                            // scroll in the opposite direction at the same time.
+                            cx.stop_propagation();
+                            if !event.is_momentum || state.is_at_rest() {
+                                state.pull_by(overscroll);
+                                if event.is_momentum {
+                                    start_rebound |= state.release(elastic_velocity, now);
+                                }
+                            }
+                        }
+                        let gesture_ended = matches!(
+                            event.touch_phase,
+                            crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
+                        );
+                        if (gesture_ended && !event.is_momentum) || event.is_momentum_ended {
+                            let velocity = state.velocity_at_lift(now).or(elastic_velocity);
+                            start_rebound |= state.release(velocity, now);
+                        }
+                        elastic_changed = state.stretch() != previous_stretch;
+                    }
+
+                    if *scroll_offset != old_scroll_offset || elastic_changed || start_rebound {
                         cx.notify(current_view);
                     }
                 }
@@ -4315,6 +4455,8 @@ pub struct InteractiveElementState {
     pub(crate) pending_keyboard_down: Option<Rc<RefCell<Option<u64>>>>,
     pub(crate) scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
     ongoing_scroll: Option<Rc<RefCell<OngoingScroll>>>,
+    max_scroll_offset: Option<Rc<RefCell<Point<Pixels>>>>,
+    elastic_state: Option<Rc<RefCell<ElasticScroll>>>,
     pub(crate) active_tooltip: Option<Rc<RefCell<Option<ActiveTooltip>>>>,
     pub(crate) style_transitions: Option<Box<StyleTransitionState>>,
 }
@@ -4858,9 +5000,10 @@ impl ScrollAnchor {
 #[derive(Default, Debug)]
 struct ScrollHandleState {
     offset: Rc<RefCell<Point<Pixels>>>,
+    elastic_state: Rc<RefCell<ElasticScroll>>,
     ongoing_scroll: Rc<RefCell<OngoingScroll>>,
     bounds: Bounds<Pixels>,
-    max_offset: Point<Pixels>,
+    max_offset: Rc<RefCell<Point<Pixels>>>,
     child_bounds: Vec<Bounds<Pixels>>,
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
@@ -4905,7 +5048,7 @@ impl ScrollHandle {
 
     /// Get the maximum scroll offset.
     pub fn max_offset(&self) -> Point<Pixels> {
-        self.0.borrow().max_offset
+        *self.0.borrow().max_offset.borrow()
     }
 
     /// Get the top child that's scrolled into view.
