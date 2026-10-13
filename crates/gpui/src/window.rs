@@ -2889,6 +2889,13 @@ impl Window {
         self.platform_window.start_window_move()
     }
 
+    /// Start an interactive window move while keeping `position` under the cursor.
+    /// This is useful when a drag turns into a native window move after it began
+    /// somewhere inside the window.
+    pub fn start_window_move_at(&self, position: Point<Pixels>) {
+        self.platform_window.start_window_move_at(position)
+    }
+
     /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);

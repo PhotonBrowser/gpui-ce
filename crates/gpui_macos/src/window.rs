@@ -2988,6 +2988,51 @@ impl PlatformWindow for MacWindow {
         }
     }
 
+    fn start_window_move_at(&self, position: Point<Pixels>) {
+        let this = self.0.lock();
+        if this.simple_fullscreen_state.is_some() {
+            return;
+        }
+        let window = this.native_window;
+        let content_height = this.content_size().height;
+        let location = Objc2NSPoint::new(
+            f64::from(position.x),
+            f64::from(content_height - position.y),
+        );
+
+        unsafe {
+            // `start_window_move` normally receives AppKit's original mouse-down event.
+            // A tab detach starts from a mouse-dragged event in the source window, whose
+            // location is unrelated to the new window. Build the equivalent mouse-down
+            // event in the destination window so AppKit keeps the tab's grab point under
+            // the cursor instead of offsetting the whole window.
+            let app: ObjcId = msg_send![class!(NSApplication), sharedApplication];
+            let current_event: ObjcId = msg_send![app, currentEvent];
+            if current_event.is_null() {
+                return;
+            }
+            let modifiers: NSEventModifierFlags = msg_send![current_event, modifierFlags];
+            let timestamp: f64 = msg_send![current_event, timestamp];
+            let event_number: NSInteger = msg_send![current_event, eventNumber];
+            let window_number: NSInteger = msg_send![window, windowNumber];
+            let event: ObjcId = msg_send![
+                class!(NSEvent),
+                mouseEventWithType: NSEventType::LeftMouseDown,
+                location: location,
+                modifierFlags: modifiers,
+                timestamp: timestamp,
+                windowNumber: window_number,
+                context: NIL,
+                eventNumber: event_number,
+                clickCount: 1_isize,
+                pressure: 1.0f32,
+            ];
+            if !event.is_null() {
+                let _: () = msg_send![window, performWindowDragWithEvent: event];
+            }
+        }
+    }
+
     fn can_start_external_drag(&self) -> bool {
         true
     }

@@ -1027,6 +1027,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn request_decorations(&self, _decorations: WindowDecorations) {}
     fn show_window_menu(&self, _position: Point<Pixels>) {}
     fn start_window_move(&self) {}
+    /// Start an interactive window move using a point within the window as the grab point.
+    /// Platforms that cannot select the grab point fall back to [`Self::start_window_move`].
+    fn start_window_move_at(&self, _position: Point<Pixels>) {
+        self.start_window_move();
+    }
     fn can_start_external_drag(&self) -> bool {
         false
     }
