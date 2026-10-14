@@ -37,15 +37,15 @@ use objc2_app_kit::{
 use objc2_foundation::NSOperatingSystemVersion;
 use objc2_foundation::{
     NSArray, NSAutoreleasePool, NSBundle, NSInteger, NSNotification, NSNotificationCenter,
-    NSNumber, NSObjectProtocol, NSPoint, NSProcessInfo, NSString, NSUInteger, NSURL,
-    NSUserDefaults,
+    NSNumber, NSObjectProtocol, NSPoint, NSProcessInfo, NSRunLoop, NSRunLoopCommonModes,
+    NSRunLoopMode, NSString, NSUInteger, NSURL, NSUserDefaults,
 };
 use parking_lot::Mutex;
 use ptr::null_mut;
 use raw_window_handle::RawWindowHandle;
 use semver::Version;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     ffi::{CStr, OsStr, c_void},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -1126,7 +1126,6 @@ impl Platform for MacPlatform {
         }
         mark_context_menu_items(&context_menu);
         state.context_menu_actions = actions;
-        let executor = state.foreground_executor.clone();
         drop(state);
         let anchor = anchor.and_then(|anchor| {
             let RawWindowHandle::AppKit(handle) = anchor.window else {
@@ -1138,33 +1137,46 @@ impl Platform for MacPlatform {
             Some((view, anchor.position))
         });
         let (chosen_tx, chosen_rx) = oneshot::channel();
-        // Menu tracking runs its own event loop until the menu closes, and
-        // choosing an item calls back into the app, so it opens after the
-        // event that asked for it rather than inside it.
-        executor
-            .spawn(async move {
-                let chosen = match anchor {
-                    // The view's origin is at its bottom left.
-                    Some((view, position)) => {
-                        let location = NSPoint::new(
-                            f64::from(position.x),
-                            view.bounds().size.height - f64::from(position.y),
-                        );
-                        context_menu.popUpMenuPositioningItem_atLocation_inView(
-                            None,
-                            location,
-                            Some(&view),
-                        )
-                    }
-                    None => context_menu.popUpMenuPositioningItem_atLocation_inView(
+        // Menu tracking runs its own event loop until the menu closes. If we
+        // call it from a foreground-executor job, that job occupies the main
+        // dispatch queue for the whole tracking session and prevents queued
+        // frame-presentation jobs from running. Defer the AppKit callout until
+        // this event has returned, using common modes so it also works when
+        // the caller is already inside a modal or tracking loop.
+        let show_menu_state = Rc::new(RefCell::new(Some((anchor, context_menu, chosen_tx))));
+        let show_menu_state_clone = show_menu_state.clone();
+        let show_menu = RcBlock::new(move || {
+            let Some((anchor, context_menu, chosen_tx)) = show_menu_state_clone.borrow_mut().take()
+            else {
+                return;
+            };
+            let chosen = match anchor {
+                // The view's origin is at its bottom left.
+                Some((view, position)) => {
+                    let location = NSPoint::new(
+                        f64::from(position.x),
+                        view.bounds().size.height - f64::from(position.y),
+                    );
+                    context_menu.popUpMenuPositioningItem_atLocation_inView(
                         None,
-                        NSEvent::mouseLocation(),
-                        None,
-                    ),
-                };
-                chosen_tx.send(chosen).ok();
-            })
-            .detach();
+                        location,
+                        Some(&view),
+                    )
+                }
+                None => context_menu.popUpMenuPositioningItem_atLocation_inView(
+                    None,
+                    NSEvent::mouseLocation(),
+                    None,
+                ),
+            };
+            chosen_tx.send(chosen).ok();
+        });
+        let modes = unsafe { NSArray::<NSRunLoopMode>::from_slice(&[NSRunLoopCommonModes]) };
+        // SAFETY: This platform method and the AppKit objects above are main-thread-only. The
+        // block is scheduled on the main run loop, and AppKit invokes it on that same thread.
+        unsafe {
+            NSRunLoop::mainRunLoop().performInModes_block(&modes, &show_menu);
+        }
         chosen_rx
     }
 
