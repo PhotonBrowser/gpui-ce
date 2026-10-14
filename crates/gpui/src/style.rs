@@ -391,7 +391,8 @@ pub struct Style {
     /// Opacity applied to this element and its children after compositing them as a group.
     pub opacity: Option<f32>,
 
-    /// A scale applied to painted contents without changing layout.
+    /// A scale applied to painted contents around the element's center.
+    /// Layout and hit testing are unchanged.
     #[refineable]
     pub scale: Size<f32>,
 

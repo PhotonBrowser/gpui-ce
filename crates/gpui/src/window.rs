@@ -3142,7 +3142,7 @@ impl Window {
     }
 
     /// Paints `f` with a scale centered on `center`. Layout and hit testing remain unchanged.
-    pub fn with_scale<R>(
+    pub(crate) fn with_scale<R>(
         &mut self,
         center: Point<Pixels>,
         scale: Size<f32>,
