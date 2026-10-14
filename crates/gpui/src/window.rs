@@ -4648,76 +4648,40 @@ impl Window {
     /// Paint the drop (non-inset) shadows from `shadows` into the scene at the current
     /// z-index. Inset shadows are skipped; paint those with [`Self::paint_inset_shadows`]
     /// after the element's background so they layer on top of the fill.
+    /// `corner_smoothing` ranges from circular corners at `0.0` to maximum smoothing at `1.0`.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_drop_shadows(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
-        shadows: &[BoxShadow],
-    ) {
-        self.paint_drop_shadows_with_corner_smoothing(bounds, corner_radii, 0.0, shadows);
-    }
-
-    /// Paints drop shadows with smoothed element and shadow corners.
-    /// Inset shadows in `shadows` are ignored.
-    pub fn paint_drop_shadows_with_corner_smoothing(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
         corner_smoothing: f32,
         shadows: &[BoxShadow],
     ) {
-        self.invalidator.debug_assert_paint();
-
-        let scale_factor = self.scale_factor();
-        let paint_scale = self.paint_scale_factor();
-        let radius_scale = (paint_scale.width + paint_scale.height) / 2.0;
-        let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
-        let element_bounds = self.cover_bounds(bounds);
-        let element_corner_radii = corner_radii.scale(scale_factor * radius_scale);
-        let corner_smoothing = corner_smoothing.clamp(0.0, 1.0);
-        for shadow in shadows {
-            if shadow.inset {
-                continue;
-            }
-            let shadow_bounds = (bounds + shadow.offset).dilate(shadow.spread_radius);
-            self.next_frame.scene.insert_primitive(Shadow {
-                order: 0,
-                blur_radius: shadow.blur_radius.scale(scale_factor * radius_scale),
-                bounds: self.cover_bounds(shadow_bounds),
-                content_mask,
-                corner_radii: corner_radii.scale(scale_factor * radius_scale),
-                color: shadow.color.opacity(opacity),
-                element_bounds,
-                element_corner_radii,
-                inset: false.into(),
-                corner_smoothing,
-            });
-        }
+        self.paint_shadows(bounds, corner_radii, corner_smoothing, shadows, false);
     }
 
     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
     /// be called after the element's background so the shadow layers on top of the fill.
     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.
+    /// `corner_smoothing` ranges from circular corners at `0.0` to maximum smoothing at `1.0`.
     pub fn paint_inset_shadows(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
-        shadows: &[BoxShadow],
-    ) {
-        self.paint_inset_shadows_with_corner_smoothing(bounds, corner_radii, 0.0, shadows);
-    }
-
-    /// Paints inset shadows with smoothed element and shadow corners.
-    /// Drop shadows in `shadows` are ignored.
-    pub fn paint_inset_shadows_with_corner_smoothing(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
         corner_smoothing: f32,
         shadows: &[BoxShadow],
+    ) {
+        self.paint_shadows(bounds, corner_radii, corner_smoothing, shadows, true);
+    }
+
+    fn paint_shadows(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+        shadows: &[BoxShadow],
+        inset: bool,
     ) {
         self.invalidator.debug_assert_paint();
 
@@ -4729,30 +4693,33 @@ impl Window {
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor * radius_scale);
         let corner_smoothing = corner_smoothing.clamp(0.0, 1.0);
-        for shadow in shadows {
-            if !shadow.inset {
-                continue;
-            }
-            let hole = (bounds + shadow.offset).dilate(-shadow.spread_radius);
-            // Clamp at zero so a large spread can't produce negative radii, which would
-            // break the SDF in the shader.
-            let zero = Pixels::ZERO;
-            let hole_corner_radii = Corners {
-                top_left: (corner_radii.top_left - shadow.spread_radius).max(zero),
-                top_right: (corner_radii.top_right - shadow.spread_radius).max(zero),
-                bottom_right: (corner_radii.bottom_right - shadow.spread_radius).max(zero),
-                bottom_left: (corner_radii.bottom_left - shadow.spread_radius).max(zero),
+
+        for shadow in shadows.iter().filter(|shadow| shadow.inset == inset) {
+            let spread = if inset {
+                -shadow.spread_radius
+            } else {
+                shadow.spread_radius
             };
+
+            let shadow_bounds = (bounds + shadow.offset).dilate(spread);
+
+            let shadow_radii = if inset {
+                // Large inset spreads must not produce negative radii in the shader.
+                corner_radii.map(|radius| (*radius - shadow.spread_radius).max(Pixels::ZERO))
+            } else {
+                corner_radii
+            };
+
             self.next_frame.scene.insert_primitive(Shadow {
                 order: 0,
                 blur_radius: shadow.blur_radius.scale(scale_factor * radius_scale),
-                bounds: self.cover_bounds(hole),
+                bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
-                corner_radii: hole_corner_radii.scale(scale_factor * radius_scale),
+                corner_radii: shadow_radii.scale(scale_factor * radius_scale),
                 color: shadow.color.opacity(opacity),
                 element_bounds,
                 element_corner_radii,
-                inset: true.into(),
+                inset: inset.into(),
                 corner_smoothing,
             });
         }
@@ -4763,21 +4730,12 @@ impl Window {
     /// into the rounded rectangle described by `bounds` and `corner_radii` — the CSS
     /// `backdrop-filter` effect (frosted glass). Typically the element then paints a translucent
     /// background quad on top so its color tints the blurred backdrop.
+    /// `corner_smoothing` ranges from circular corners at `0.0` to maximum smoothing at `1.0`.
     ///
     /// Does nothing when `filters` produce no visible blur.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn paint_backdrop_filter(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
-        filters: &[Filter],
-    ) {
-        self.paint_backdrop_filter_with_corner_smoothing(bounds, corner_radii, 0.0, filters);
-    }
-
-    /// Paints a backdrop filter clipped to smoothed corners.
-    pub fn paint_backdrop_filter_with_corner_smoothing(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
@@ -4813,23 +4771,13 @@ impl Window {
     /// everything `f` paints into an offscreen target, blurs it as a single layer, and
     /// composites the result back into the rounded rectangle described by `bounds` and
     /// `corner_radii` — the CSS `filter` effect (e.g. blurring an element and its children).
+    /// `corner_smoothing` ranges from circular corners at `0.0` to maximum smoothing at `1.0`.
     ///
     /// When `filters` produce no visible blur this simply runs `f` with no offscreen
     /// indirection.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     pub fn with_filter_layer<R>(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
-        filters: &[Filter],
-        f: impl FnOnce(&mut Self) -> R,
-    ) -> R {
-        self.with_filter_layer_with_corner_smoothing(bounds, corner_radii, 0.0, filters, f)
-    }
-
-    /// Runs `f` in a content-filter group clipped to smoothed corners.
-    pub fn with_filter_layer_with_corner_smoothing<R>(
         &mut self,
         bounds: Bounds<Pixels>,
         corner_radii: Corners<Pixels>,
@@ -4921,7 +4869,8 @@ impl Window {
 
     /// Paint one or more quads into the scene for the next frame at the current stacking context.
     /// Quads are colored rectangular regions with an optional background, border, and corner radius.
-    /// see [`fill`], [`outline`], and [`quad`] to construct this type.
+    /// Use [`PaintQuad::new`] and its builder methods to construct the quad.
+    /// `quad.corner_smoothing` ranges from circular corners at `0.0` to maximum smoothing at `1.0`.
     ///
     /// This method should only be called as part of the paint phase of element drawing.
     ///
@@ -4929,11 +4878,6 @@ impl Window {
     /// where the circular arcs meet. This will not display well when combined with dashed borders.
     /// Use `Corners::clamp_radii_for_quad_size` if the radii should fit within the bounds.
     pub fn paint_quad(&mut self, quad: PaintQuad) {
-        self.paint_quad_with_corner_smoothing(quad, 0.0);
-    }
-
-    /// Paints `quad` with smoothed corners.
-    pub fn paint_quad_with_corner_smoothing(&mut self, quad: PaintQuad, corner_smoothing: f32) {
         self.invalidator.debug_assert_paint();
 
         let opacity = self.element_opacity();
@@ -4954,7 +4898,7 @@ impl Window {
             border_style: quad.border_style,
             border_dashed_length: quad.border_dashed_length,
             border_dashed_gap: quad.border_dashed_gap,
-            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
+            corner_smoothing: quad.corner_smoothing.clamp(0.0, 1.0),
             padding: 0,
         };
 
@@ -5387,28 +5331,8 @@ impl Window {
     ///
     /// The visible region rendered is `bounds.intersect(&image_bounds)`, with `corner_radii`
     /// applied to `bounds`.
+    /// `corner_smoothing` ranges from circular corners at `0.0` to maximum smoothing at `1.0`.
     pub fn paint_image(
-        &mut self,
-        bounds: Bounds<Pixels>,
-        image_bounds: Bounds<Pixels>,
-        corner_radii: Corners<Pixels>,
-        data: Arc<RenderImage>,
-        frame_index: usize,
-        grayscale: bool,
-    ) -> Result<()> {
-        self.paint_image_with_corner_smoothing(
-            bounds,
-            image_bounds,
-            corner_radii,
-            0.0,
-            data,
-            frame_index,
-            grayscale,
-        )
-    }
-
-    /// Paints an image with smoothed corners.
-    pub fn paint_image_with_corner_smoothing(
         &mut self,
         bounds: Bounds<Pixels>,
         image_bounds: Bounds<Pixels>,
@@ -7808,7 +7732,7 @@ impl Window {
                     .iter()
                     .find(|hitbox| hitbox.id == hitbox_id)
             {
-                self.paint_quad(crate::fill(hitbox.bounds, crate::rgba(0x61afef4d)));
+                self.paint_quad(PaintQuad::new(hitbox.bounds).background(crate::rgba(0x61afef4d)));
             }
         }
     }
@@ -8312,19 +8236,27 @@ impl From<[u8; 20]> for ElementId {
 
 /// A rectangle to be rendered in the window at the given position and size.
 /// Passed as an argument [`Window::paint_quad`].
-#[derive(Clone)]
+#[derive(Clone, derive_setters::Setters)]
+#[setters(into, generate = false)]
 pub struct PaintQuad {
     /// The bounds of the quad within the window.
     pub bounds: Bounds<Pixels>,
     /// The radii of the quad's corners.
+    #[setters(generate)]
     pub corner_radii: Corners<Pixels>,
+    /// Corner smoothing, from circular corners at `0.0` to maximum smoothing at `1.0`.
+    pub corner_smoothing: f32,
     /// The background color of the quad.
+    #[setters(generate)]
     pub background: Background,
     /// The widths of the quad's borders.
+    #[setters(generate)]
     pub border_widths: Edges<Pixels>,
     /// The background painted into the quad's borders.
+    #[setters(generate)]
     pub border_color: Background,
     /// The style of the quad's borders.
+    #[setters(generate)]
     pub border_style: BorderStyle,
     /// The length of each border dash, as a multiple of the border width.
     pub border_dashed_length: f32,
@@ -8333,34 +8265,25 @@ pub struct PaintQuad {
 }
 
 impl PaintQuad {
-    /// Sets the corner radii of the quad.
-    pub fn corner_radii(self, corner_radii: impl Into<Corners<Pixels>>) -> Self {
-        PaintQuad {
-            corner_radii: corner_radii.into(),
-            ..self
+    /// Creates a transparent quad with no border or rounded corners.
+    pub fn new(bounds: impl Into<Bounds<Pixels>>) -> Self {
+        Self {
+            bounds: bounds.into(),
+            corner_radii: (0.).into(),
+            corner_smoothing: 0.0,
+            background: transparent_black().into(),
+            border_widths: (0.).into(),
+            border_color: transparent_black().into(),
+            border_style: BorderStyle::default(),
+            border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
+            border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
         }
     }
 
-    /// Sets the border widths of the quad.
-    pub fn border_widths(self, border_widths: impl Into<Edges<Pixels>>) -> Self {
+    /// Sets the corner smoothing, clamped to the range `0.0..=1.0`.
+    pub fn corner_smoothing(self, amount: f32) -> Self {
         PaintQuad {
-            border_widths: border_widths.into(),
-            ..self
-        }
-    }
-
-    /// Sets the background painted into the quad's borders.
-    pub fn border_color(self, border_color: impl Into<Background>) -> Self {
-        PaintQuad {
-            border_color: border_color.into(),
-            ..self
-        }
-    }
-
-    /// Sets the background color of the quad.
-    pub fn background(self, background: impl Into<Background>) -> Self {
-        PaintQuad {
-            background: background.into(),
+            corner_smoothing: amount.clamp(0.0, 1.0),
             ..self
         }
     }
@@ -8379,59 +8302,6 @@ impl PaintQuad {
             border_dashed_gap: gap_per_border_width.max(0.0),
             ..self
         }
-    }
-}
-
-/// Creates a quad with the given parameters.
-pub fn quad(
-    bounds: Bounds<Pixels>,
-    corner_radii: impl Into<Corners<Pixels>>,
-    background: impl Into<Background>,
-    border_widths: impl Into<Edges<Pixels>>,
-    border_color: impl Into<Background>,
-    border_style: BorderStyle,
-) -> PaintQuad {
-    PaintQuad {
-        bounds,
-        corner_radii: corner_radii.into(),
-        background: background.into(),
-        border_widths: border_widths.into(),
-        border_color: border_color.into(),
-        border_style,
-        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
-        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
-    }
-}
-
-/// Creates a filled quad with the given bounds and background color.
-pub fn fill(bounds: impl Into<Bounds<Pixels>>, background: impl Into<Background>) -> PaintQuad {
-    PaintQuad {
-        bounds: bounds.into(),
-        corner_radii: (0.).into(),
-        background: background.into(),
-        border_widths: (0.).into(),
-        border_color: transparent_black().into(),
-        border_style: BorderStyle::default(),
-        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
-        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
-    }
-}
-
-/// Creates a rectangle outline with the given bounds, border color, and a 1px border width
-pub fn outline(
-    bounds: impl Into<Bounds<Pixels>>,
-    border_color: impl Into<Background>,
-    border_style: BorderStyle,
-) -> PaintQuad {
-    PaintQuad {
-        bounds: bounds.into(),
-        corner_radii: (0.).into(),
-        background: transparent_black().into(),
-        border_widths: (1.).into(),
-        border_color: border_color.into(),
-        border_style,
-        border_dashed_length: crate::scene::DEFAULT_BORDER_DASHED_LENGTH,
-        border_dashed_gap: crate::scene::DEFAULT_BORDER_DASHED_GAP,
     }
 }
 

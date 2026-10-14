@@ -2556,6 +2556,7 @@ dependencies = [
 name = "gpui_ce_elements"
 version = "0.1.0"
 dependencies = [
+ "derive_setters",
  "gpui-ce",
  "gpui-ce-fonts",
  "gpui_ce_parley",
