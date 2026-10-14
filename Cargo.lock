@@ -2747,6 +2747,7 @@ dependencies = [
  "gpui-ce",
  "naga 24.0.0",
  "naga 29.0.4",
+ "smallvec",
  "wgsl-rs",
  "windows 0.62.2",
 ]

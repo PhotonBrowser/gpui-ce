@@ -1,16 +1,16 @@
 use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropFilter, Background, BorderStyle, Bounds,
-    BoxShadow, Capslock, ColorExt, Context, Corners, CursorHideMode, CursorStyle, Decorations,
-    DevicePixels, DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect,
-    Entity, EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global,
-    GlobalElementId, GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IntoElement, IsZero,
-    KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp,
-    LineLayoutIndex, MenuAnchor, MenuItem, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    Motion, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams,
-    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
+    BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+    EntityId, EventEmitter, FileDropEvent, Filter, FilterBoundary, FontId, Global, GlobalElementId,
+    GlyphId, GlyphRenderMode, GpuSpecs, InputHandler, IntoElement, IsZero, KeyBinding, KeyContext,
+    KeyDownEvent, KeyEvent, Keystroke, KeystrokeEvent, LayoutId, Lerp, LineLayoutIndex, MenuAnchor,
+    MenuItem, Modifiers, ModifiersChangedEvent, MonochromeSprite, Motion, MouseButton, MouseEvent,
+    MouseMoveEvent, MouseUpEvent, PaintSurface, Path, Pixels, PlatformAtlas, PlatformDisplay,
+    PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite, Priority,
+    PromptButton, PromptLevel, Quad, RasterizedGlyphFormat, Render, RenderGlyphParams, RenderImage,
+    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, ResolvedDirection,
     SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledFilter, ScaledPixels,
     Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet,
     Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
@@ -1323,7 +1323,6 @@ pub struct Window {
     /// Bounds of the parent `Div` currently prepainting this element as one of its children.
     /// Inset transitions use these bounds to resolve `auto` from the child's rendered position.
     style_transition_containing_bounds: Option<Bounds<Pixels>>,
-    pub(crate) element_opacity: f32,
     pub(crate) content_mask_stack: Vec<ContentMask<Pixels>>,
     pub(crate) requested_autoscroll: Option<Bounds<Pixels>>,
     /// The [`TextInputConfiguration`] most recently forwarded to the platform
@@ -2087,7 +2086,6 @@ impl Window {
             paint_scale_stack: Vec::new(),
             style_transition_containing_bounds: None,
             content_mask_stack: Vec::new(),
-            element_opacity: 1.0,
             requested_autoscroll: None,
             last_text_input_configuration: None,
             focused_text_input_active: false,
@@ -4234,18 +4232,47 @@ impl Window {
     pub(crate) fn with_element_opacity<R>(
         &mut self,
         opacity: Option<f32>,
-        f: impl FnOnce(&mut Self) -> R,
+        paint: impl FnOnce(&mut Self) -> R,
     ) -> R {
-        self.invalidator.debug_assert_paint_or_prepaint();
+        self.invalidator.debug_assert_paint();
+        let opacity = opacity.unwrap_or(1.0).clamp(0.0, 1.0);
 
-        let Some(opacity) = opacity else {
-            return f(self);
+        if opacity == 1.0 {
+            return paint(self);
+        }
+
+        // The existing targets cover the viewport, preserving shadows and visible overflow.
+        // Child paint operations already carry their clipping and edge fades.
+        let bounds = self.cover_bounds(Bounds::new(Point::default(), self.viewport_size()));
+        let boundary = FilterBoundary {
+            order: 0,
+            bounds,
+            content_mask: ContentMask {
+                bounds,
+                fade_out: Edges::default(),
+            },
+            corner_radii: Corners::default(),
+            corner_smoothing: 0.0,
+            filters: SmallVec::new(),
+            opacity,
+            is_start: true,
         };
 
-        let previous_opacity = self.element_opacity;
-        self.element_opacity = previous_opacity * opacity;
-        let result = f(self);
-        self.element_opacity = previous_opacity;
+        self.with_filter_boundary(boundary, paint)
+    }
+
+    fn with_filter_boundary<R>(
+        &mut self,
+        boundary: FilterBoundary,
+        paint: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.next_frame.scene.insert_primitive(boundary.clone());
+        let result = paint(self);
+        self.next_frame.scene.insert_primitive(FilterBoundary {
+            is_start: false,
+            ..boundary
+        });
+
         result
     }
 
@@ -4338,14 +4365,6 @@ impl Window {
             .last()
             .copied()
             .unwrap_or_default()
-    }
-
-    /// Obtain the current element opacity. This method should only be called during the
-    /// prepaint phase of element drawing.
-    #[inline]
-    pub(crate) fn element_opacity(&self) -> f32 {
-        self.invalidator.debug_assert_paint_or_prepaint();
-        self.element_opacity
     }
 
     /// Obtain the current content mask. This method should only be called during element drawing.
@@ -4689,7 +4708,6 @@ impl Window {
         let paint_scale = self.paint_scale_factor();
         let radius_scale = (paint_scale.width + paint_scale.height) / 2.0;
         let content_mask = self.snapped_content_mask();
-        let opacity = self.element_opacity();
         let element_bounds = self.cover_bounds(bounds);
         let element_corner_radii = corner_radii.scale(scale_factor * radius_scale);
         let corner_smoothing = corner_smoothing.clamp(0.0, 1.0);
@@ -4716,7 +4734,7 @@ impl Window {
                 bounds: self.cover_bounds(shadow_bounds),
                 content_mask,
                 corner_radii: shadow_radii.scale(scale_factor * radius_scale),
-                color: shadow.color.opacity(opacity),
+                color: shadow.color,
                 element_bounds,
                 element_corner_radii,
                 inset: inset.into(),
@@ -4763,7 +4781,7 @@ impl Window {
             corner_radii: corner_radii.scale(scale_factor * radius_scale),
             corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
             filters,
-            opacity: self.element_opacity(),
+            opacity: 1.0,
         });
     }
 
@@ -4799,13 +4817,6 @@ impl Window {
             return f(self);
         }
 
-        // Snapshot the (scaled) group parameters once so the start and end markers agree.
-        //
-        // `opacity` is 1.0 — NOT `element_opacity()`. The group's children/bg/border are painted
-        // through the normal paint methods while `element_opacity` is still in effect, so they
-        // already carry the element's opacity (consistent with gpui's per-primitive opacity for
-        // non-filtered elements). Re-applying it at composite time would double it (e.g.
-        // `.blur(r).opacity(0.5)` would render at 0.25 instead of 0.5).
         let boundary = FilterBoundary {
             order: 0,
             bounds: self.snap_bounds(bounds),
@@ -4817,14 +4828,7 @@ impl Window {
             is_start: true,
         };
 
-        self.next_frame.scene.insert_primitive(boundary.clone());
-        let result = f(self);
-        self.next_frame.scene.insert_primitive(FilterBoundary {
-            is_start: false,
-            ..boundary
-        });
-
-        result
+        self.with_filter_boundary(boundary, f)
     }
 
     fn largest_border_interior(quad: &Quad) -> Bounds<ScaledPixels> {
@@ -4880,15 +4884,14 @@ impl Window {
     pub fn paint_quad(&mut self, quad: PaintQuad) {
         self.invalidator.debug_assert_paint();
 
-        let opacity = self.element_opacity();
         let snapped_bounds = self.snap_bounds(quad.bounds);
         let snapped_border_widths = self.snap_border_widths(quad.border_widths);
         let quad = Quad {
             order: 0,
             bounds: snapped_bounds,
             content_mask: self.snapped_content_mask(),
-            background: quad.background.opacity(opacity),
-            border_color: quad.border_color.opacity(opacity),
+            background: quad.background,
+            border_color: quad.border_color,
             corner_radii: quad.corner_radii.scale(
                 self.scale_factor()
                     * (self.paint_scale_factor().width + self.paint_scale_factor().height)
@@ -4962,7 +4965,6 @@ impl Window {
 
         let scale_factor = self.scale_factor();
         let mut content_mask = self.content_mask();
-        let opacity = self.element_opacity();
         path.bounds = self.transform_paint_bounds(path.bounds);
         content_mask.bounds = self.transform_paint_bounds(content_mask.bounds);
         for vertex in &mut path.vertices {
@@ -4970,7 +4972,7 @@ impl Window {
         }
         path.content_mask = content_mask;
         let color: Background = color.into();
-        path.color = color.opacity(opacity);
+        path.color = color;
         self.next_frame
             .scene
             .insert_primitive(path.scale(scale_factor));
@@ -4998,18 +5000,13 @@ impl Window {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), height),
         };
-        let element_opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
             padding: 0,
             bounds,
             content_mask: self.snapped_content_mask(),
-            color: style
-                .color
-                .unwrap_or_default()
-                .opacity(element_opacity)
-                .into(),
+            color: style.color.unwrap_or_default().into(),
             thickness,
             wavy: style.wavy.into(),
         });
@@ -5032,7 +5029,6 @@ impl Window {
             origin: origin.map(|c| ScaledPixels(round_to_device_pixel(c.0, scale_factor))),
             size: size(self.snap_stroke(width), self.snap_stroke(height)),
         };
-        let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(Underline {
             order: 0,
@@ -5040,7 +5036,7 @@ impl Window {
             bounds,
             content_mask: self.snapped_content_mask(),
             thickness: self.snap_stroke(style.thickness),
-            color: style.color.unwrap_or_default().opacity(opacity).into(),
+            color: style.color.unwrap_or_default().into(),
             wavy: false.into(),
         });
     }
@@ -5063,7 +5059,6 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let element_opacity = self.element_opacity();
         let scale_factor = self.scale_factor();
         let paint_scale = self.paint_scale_factor();
         if paint_scale.width <= 0.0 || paint_scale.height <= 0.0 {
@@ -5091,13 +5086,7 @@ impl Window {
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(
-            integer_origin,
-            params,
-            color,
-            element_opacity,
-            transformation,
-        )
+        self.paint_glyph_from_atlas(integer_origin, params, color, transformation)
     }
 
     fn paint_glyph_from_atlas(
@@ -5105,7 +5094,6 @@ impl Window {
         integer_origin: Point<ScaledPixels>,
         params: RenderGlyphParams,
         mask_color: Hsla,
-        opacity: f32,
         transformation: TransformationMatrix,
     ) -> Result<()> {
         let text_system = self.text_system().clone();
@@ -5132,7 +5120,7 @@ impl Window {
                     padding: 0,
                     bounds,
                     content_mask,
-                    color: mask_color.opacity(opacity).into(),
+                    color: mask_color.into(),
                     tile,
                     transformation,
                 });
@@ -5143,7 +5131,7 @@ impl Window {
                     padding: 0,
                     bounds,
                     content_mask,
-                    color: mask_color.opacity(opacity).into(),
+                    color: mask_color.into(),
                     tile,
                     transformation,
                 });
@@ -5167,7 +5155,7 @@ impl Window {
                     corner_radii: Default::default(),
                     content_mask,
                     tile,
-                    opacity,
+                    opacity: 1.0,
                 });
             }
         }
@@ -5175,6 +5163,10 @@ impl Window {
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+        if self.next_frame.scene.is_in_filter_group() {
+            return false;
+        }
+
         if self
             .platform_window
             .background_appearance()
@@ -5249,13 +5241,7 @@ impl Window {
             raster_style,
         };
 
-        self.paint_glyph_from_atlas(
-            integer_origin,
-            params,
-            color,
-            self.element_opacity(),
-            transformation,
-        )
+        self.paint_glyph_from_atlas(integer_origin, params, color, transformation)
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.
@@ -5272,7 +5258,6 @@ impl Window {
     ) -> Result<()> {
         self.invalidator.debug_assert_paint();
 
-        let element_opacity = self.element_opacity();
         let bounds = self.snap_bounds(bounds);
 
         let params = RenderSvgParams {
@@ -5315,7 +5300,7 @@ impl Window {
             padding: 0,
             bounds: final_bounds,
             content_mask,
-            color: color.opacity(element_opacity).into(),
+            color: color.into(),
             tile,
             transformation,
         });
@@ -5418,7 +5403,6 @@ impl Window {
         let corner_radii = corner_radii
             .clamp_radii_for_quad_size(visible_bounds.size)
             .scale(self.scale_factor() * radius_scale);
-        let opacity = self.element_opacity();
 
         self.next_frame.scene.insert_primitive(PolychromeSprite {
             order: 0,
@@ -5428,7 +5412,7 @@ impl Window {
             content_mask,
             corner_radii,
             tile: sub_tile,
-            opacity,
+            opacity: 1.0,
         });
         Ok(())
     }
@@ -5442,26 +5426,21 @@ impl Window {
         source: impl Into<crate::SurfaceSource>,
         corner_radii: Corners<Pixels>,
     ) {
-        use crate::PaintSurface;
-
         self.invalidator.debug_assert_paint();
 
         let bounds = self.snap_bounds(bounds);
         let content_mask = self.snapped_content_mask();
         let paint_scale = self.paint_scale_factor();
         let radius_scale = (paint_scale.width + paint_scale.height) / 2.0;
-        self.next_frame.scene.insert_surface(
-            PaintSurface {
-                order: 0,
-                bounds,
-                content_mask,
-                corner_radii: corner_radii
-                    .scale(self.scale_factor() * radius_scale)
-                    .clamp_radii_for_quad_size(bounds.size),
-                source: source.into(),
-            },
-            self.element_opacity(),
-        );
+        self.next_frame.scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask,
+            corner_radii: corner_radii
+                .scale(self.scale_factor() * radius_scale)
+                .clamp_radii_for_quad_size(bounds.size),
+            source: source.into(),
+        });
     }
 
     /// Removes an image from the sprite atlas.
@@ -8311,9 +8290,10 @@ mod pointer_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::FluentBuilder;
     use crate::{
-        DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths, FocusHandle, Font,
-        FontMetrics, ImageSource, InlineLayout, InlineLayoutRequest, InputEvent,
+        ColorExt, DragMoveEvent, Empty, ExternalDragPayload, ExternalPaths, FileDragPaths,
+        FocusHandle, Font, FontMetrics, ImageSource, InlineLayout, InlineLayoutRequest, InputEvent,
         InteractiveElement, LineLayout, LongPressEvent, MouseDownEvent, ParentElement,
         PlatformTextSystem, PreparedRasterStyle, RasterColorEffect, RasterStyleRequest,
         RasterizedGlyph, RequestFrameOptions, ShaderBool, StatefulInteractiveElement, Styled,
@@ -8580,17 +8560,17 @@ mod tests {
         test_window.draw();
 
         test_window.update(|_, window, _| {
-            assert_eq!(window.rendered_primitive_counts(), (0, 1, 1, 4));
+            assert_eq!(window.rendered_primitive_counts(), (0, 2, 0, 4));
             let scene = &window.rendered_frame.scene;
-            let expected_color = hsla(0.6, 0.7, 0.4, 0.8).opacity(0.5).into();
+            let expected_color = hsla(0.6, 0.7, 0.4, 0.8).into();
 
             assert_eq!(scene.monochrome_sprites[0].color, expected_color);
-            assert_eq!(scene.subpixel_sprites[0].color, expected_color);
+            assert_eq!(scene.monochrome_sprites[1].color, expected_color);
             assert!(
                 scene
                     .polychrome_sprites
                     .iter()
-                    .all(|sprite| sprite.opacity == 0.5)
+                    .all(|sprite| sprite.opacity == 1.0)
             );
             assert_eq!(
                 scene.monochrome_sprites[0].bounds.origin,
@@ -8601,7 +8581,7 @@ mod tests {
                 crate::AtlasTextureKind::Monochrome
             );
             assert_eq!(
-                scene.subpixel_sprites[0].tile.texture_id.kind,
+                scene.monochrome_sprites[1].tile.texture_id.kind,
                 crate::AtlasTextureKind::Subpixel
             );
             assert_eq!(
@@ -8794,7 +8774,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(shadows.len(), 3);
-        let gradient = shadow_gradient().opacity(0.5);
+        let gradient = shadow_gradient();
         let drop_gradient = shadows
             .iter()
             .find(|shadow| shadow.inset == ShaderBool::Disabled && shadow.color == gradient)
@@ -8810,8 +8790,8 @@ mod tests {
 
         assert_eq!(
             solid.color.as_solid(),
-            Some(hsla(0.3, 0.7, 0.4, 0.2)),
-            "element opacity should apply to solid shadow paint"
+            Some(hsla(0.3, 0.7, 0.4, 0.4)),
+            "shadow alpha stays intrinsic until the group composite"
         );
         assert_eq!(drop_gradient.element_bounds, inset_gradient.element_bounds);
         assert!(drop_gradient.bounds.size.width > drop_gradient.element_bounds.size.width);
@@ -8854,6 +8834,7 @@ mod tests {
                     scene
                         .filter_boundaries
                         .iter()
+                        .filter(|boundary| !boundary.filters.is_empty())
                         .map(|boundary| boundary.corner_smoothing),
                 );
                 assert_smoothing(
@@ -9822,5 +9803,124 @@ mod tests {
                 );
             })
             .unwrap();
+    }
+
+    struct CachedOpacityChild {
+        renders: Rc<Cell<usize>>,
+        paints: Rc<Cell<usize>>,
+    }
+
+    impl Render for CachedOpacityChild {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let paints = self.paints.clone();
+
+            div().size(px(20.0)).bg(crate::red()).child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        paints.set(paints.get() + 1);
+                        window.paint_quad(PaintQuad::new(bounds).background(crate::blue()));
+                    },
+                )
+                .size_full()
+                .opacity(0.5),
+            )
+        }
+    }
+
+    struct CachedOpacityParent {
+        opacity: Option<f32>,
+        child: Entity<CachedOpacityChild>,
+        cached: bool,
+    }
+
+    impl Render for CachedOpacityParent {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let mut child_style = div().size(px(20.0));
+            let child = if self.cached {
+                self.child
+                    .clone()
+                    .cached(child_style.style().clone())
+                    .into_any_element()
+            } else {
+                self.child.clone().into_any_element()
+            };
+
+            div()
+                .size(px(40.0))
+                .when_some(self.opacity, |parent, opacity| parent.opacity(opacity))
+                .child(child)
+        }
+    }
+
+    #[test]
+    fn parent_opacity_changes_replay_cached_canvas_groups() {
+        let renders = Rc::new(Cell::new(0));
+        let paints = Rc::new(Cell::new(0));
+        let mut app = TestApp::new();
+        let mut test_window = app.open_window(|_, cx| CachedOpacityParent {
+            opacity: None,
+            cached: true,
+            child: cx.new(|_| CachedOpacityChild {
+                renders: renders.clone(),
+                paints: paints.clone(),
+            }),
+        });
+        test_window.draw();
+        let initial_renders = renders.get();
+        let initial_paints = paints.get();
+        assert!(initial_renders > 0);
+        assert!(initial_paints > 0);
+
+        let scene_snapshot = |scene: &Scene| {
+            (
+                scene.render_commands().to_vec(),
+                scene
+                    .quads
+                    .iter()
+                    .map(|quad| (quad.order, quad.bounds, quad.content_mask, quad.background))
+                    .collect::<Vec<_>>(),
+                scene
+                    .filter_boundaries
+                    .iter()
+                    .map(|boundary| {
+                        (
+                            boundary.bounds,
+                            boundary.content_mask,
+                            boundary.opacity,
+                            boundary.is_start,
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        for opacity in [Some(0.5), Some(0.25), Some(1.0), Some(0.0), None] {
+            let mut fresh_app = TestApp::new();
+            let mut fresh_window = fresh_app.open_window(|_, cx| CachedOpacityParent {
+                opacity,
+                cached: false,
+                child: cx.new(|_| CachedOpacityChild {
+                    renders: Rc::new(Cell::new(0)),
+                    paints: Rc::new(Cell::new(0)),
+                }),
+            });
+            fresh_window.draw();
+            let fresh_scene =
+                fresh_window.update(|_, window, _| scene_snapshot(&window.rendered_frame.scene));
+
+            test_window.update(|view, _, cx| {
+                view.opacity = opacity;
+                cx.notify();
+            });
+            test_window.draw();
+            test_window.update(|_, window, _| {
+                let scene = &window.rendered_frame.scene;
+                assert_eq!(scene_snapshot(scene), fresh_scene, "opacity {opacity:?}");
+            });
+            assert_eq!(renders.get(), initial_renders);
+            assert_eq!(paints.get(), initial_paints);
+        }
     }
 }
