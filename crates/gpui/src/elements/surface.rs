@@ -10,7 +10,10 @@ use core_video::pixel_buffer::CVPixelBuffer;
 use metal::SharedEvent;
 use refineable::Refineable;
 #[cfg(target_os = "macos")]
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 /// A source of a surface's content.
 #[derive(Clone)]
@@ -146,10 +149,22 @@ pub struct ExternalMetalSurface {
     pub image_buffer: CVPixelBuffer,
     /// Optional producer fence.
     pub wait: Option<MetalSharedEventWait>,
-    /// Called immediately before a command buffer containing this surface is submitted.
+    /// Called immediately before a command buffer containing this surface is committed.
     pub on_gpu_submitted: Arc<dyn Fn() + Send + Sync>,
     /// Called after the GPU completes a command buffer sampling this resource.
     pub on_gpu_complete: Arc<dyn Fn() + Send + Sync>,
+    /// Optional feedback for a window drawable that contains this surface.
+    /// The timestamp is Metal's host-time `presentedTime` in seconds; zero
+    /// means the drawable was dropped or never displayed.
+    pub on_drawable_presented: Option<Arc<dyn Fn(u64, f64) + Send + Sync>>,
+    /// Live diagnostics gate. When false, the Metal renderer does not install
+    /// a presented handler for this surface.
+    pub drawable_presentation_feedback_enabled: Option<Arc<AtomicBool>>,
+    /// Optional command-buffer feedback for an actual window drawable. The
+    /// ID is that drawable's Metal identity, shared with presentation feedback.
+    pub on_gpu_sampling_submitted: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    pub on_gpu_sampling_completed: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    pub gpu_sampling_feedback_enabled: Option<Arc<AtomicBool>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -167,6 +182,10 @@ impl std::fmt::Debug for ExternalMetalSurface {
         f.debug_struct("ExternalMetalSurface")
             .field("descriptor", &self.descriptor)
             .field("wait", &self.wait)
+            .field(
+                "has_presentation_feedback",
+                &self.on_drawable_presented.is_some(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -210,7 +229,68 @@ impl ExternalMetalSurface {
             wait,
             on_gpu_submitted: Arc::new(on_gpu_submitted),
             on_gpu_complete: Arc::new(on_gpu_complete),
+            on_drawable_presented: None,
+            drawable_presentation_feedback_enabled: None,
+            on_gpu_sampling_submitted: None,
+            on_gpu_sampling_completed: None,
+            gpu_sampling_feedback_enabled: None,
         }
+    }
+
+    /// Registers an optional callback for the actual presentation of a
+    /// window drawable that samples this surface.
+    pub fn with_drawable_presentation_feedback(
+        mut self,
+        enabled: Arc<AtomicBool>,
+        callback: impl Fn(u64, f64) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_drawable_presented = Some(Arc::new(callback));
+        self.drawable_presentation_feedback_enabled = Some(enabled);
+        self
+    }
+
+    /// Registers opt-in callbacks for the command buffer that samples this
+    /// surface into a window drawable. Offscreen command buffers have no ID.
+    pub fn with_gpu_sampling_feedback(
+        mut self,
+        enabled: Arc<AtomicBool>,
+        submitted: impl Fn(u64) + Send + Sync + 'static,
+        completed: impl Fn(u64) + Send + Sync + 'static,
+    ) -> Self {
+        self.on_gpu_sampling_submitted = Some(Arc::new(submitted));
+        self.on_gpu_sampling_completed = Some(Arc::new(completed));
+        self.gpu_sampling_feedback_enabled = Some(enabled);
+        self
+    }
+
+    pub fn drawable_presentation_callback(&self) -> Option<Arc<dyn Fn(u64, f64) + Send + Sync>> {
+        if !self
+            .drawable_presentation_feedback_enabled
+            .as_ref()?
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        self.on_drawable_presented.clone()
+    }
+
+    pub fn gpu_sampling_feedback_callbacks(
+        &self,
+    ) -> Option<(
+        Arc<dyn Fn(u64) + Send + Sync>,
+        Arc<dyn Fn(u64) + Send + Sync>,
+    )> {
+        if !self
+            .gpu_sampling_feedback_enabled
+            .as_ref()?
+            .load(Ordering::Acquire)
+        {
+            return None;
+        }
+        Some((
+            self.on_gpu_sampling_submitted.clone()?,
+            self.on_gpu_sampling_completed.clone()?,
+        ))
     }
 }
 

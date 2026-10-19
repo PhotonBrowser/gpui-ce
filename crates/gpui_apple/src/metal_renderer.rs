@@ -48,6 +48,8 @@ fn external_surface_trace_enabled() -> bool {
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
+/// Two drawables bound per-window surfaces while preserving double buffering.
+const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 2;
 
 // Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
 // binding at 2, Naga's runtime-array sizes buffer at 3.
@@ -279,8 +281,7 @@ pub struct MetalRenderer {
     external_surface_frame: u64,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
-    // Offscreen scene target (the scene is rendered here, then blitted to the drawable, so blur
-    // passes can sample already-painted content), the half-res ping/pong blur targets, and a
+    // Offscreen scene target for backdrop sampling, half-res ping/pong blur targets, and a
     // full-res target for content-filter groups.
     scene_color_texture: Option<metal::Texture>,
     backdrop_snapshot_texture: Option<metal::Texture>,
@@ -305,7 +306,7 @@ impl MetalRenderer {
         let layer = new_window_layer(transparent);
         layer.set_device(&device);
         layer.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
-        layer.set_maximum_drawable_count(3);
+        layer.set_maximum_drawable_count(MAXIMUM_DRAWABLE_COUNT);
         // Allow texture reading for visual tests (captures screenshots without ScreenCaptureKit)
         #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
         layer.set_framebuffer_only(false);
@@ -614,6 +615,26 @@ impl MetalRenderer {
         let full_w = size.width.0 as u64;
         let full_h = size.height.0 as u64;
 
+        // These targets scale with the whole window. Drop them as soon as the
+        // current scene no longer needs them instead of retaining them for the
+        // lifetime of the renderer after a chart, menu, or filter disappears.
+        if !requirements.uses_path_target {
+            self.path_intermediate_texture = None;
+            self.path_intermediate_msaa_texture = None;
+        }
+        if requirements.backdrop_filter_count == 0 {
+            self.scene_color_texture = None;
+        }
+        if !requirements.uses_blur_target {
+            self.blur_ping_texture = None;
+            self.blur_pong_texture = None;
+        }
+        if requirements.backdrop_filter_count == 0 || requirements.isolated_target_count == 0 {
+            self.backdrop_snapshot_texture = None;
+        }
+        self.group_textures
+            .truncate(requirements.isolated_target_count);
+
         let make_color_texture = |width: u64, height: u64| {
             let descriptor = metal::TextureDescriptor::new();
             descriptor.set_width(width.max(1));
@@ -655,7 +676,7 @@ impl MetalRenderer {
             }
         }
 
-        if requirements.uses_offscreen_target {
+        if requirements.backdrop_filter_count > 0 {
             self.scene_color_texture
                 .get_or_insert_with(|| make_color_texture(full_w, full_h));
         }
@@ -714,24 +735,51 @@ impl MetalRenderer {
             );
             return;
         };
+        let drawable_id = drawable.drawable_id() as u64;
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            match self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size) {
-                Ok(command_buffer) => command_buffer,
-                Err(error) => {
-                    log::error!("failed to render pre-sized scene: {error}");
-                    return;
-                }
-            };
+        let command_buffer = match self.draw_primitives(
+            scene,
+            &mut instance_buffer,
+            drawable,
+            viewport_size,
+            Some(drawable_id),
+        ) {
+            Ok(command_buffer) => command_buffer,
+            Err(error) => {
+                log::error!("failed to render pre-sized scene: {error}");
+                return;
+            }
+        };
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
 
+        let presentation_feedbacks = scene
+            .surfaces
+            .iter()
+            .filter_map(|surface| match &surface.source {
+                SurfaceSource::ExternalMetal(external) => external.drawable_presentation_callback(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !presentation_feedbacks.is_empty() {
+            let handler = ConcreteBlock::new(move |drawable: &metal::DrawableRef| {
+                let drawable_id = drawable.drawable_id() as u64;
+                let presented_time = drawable.presented_time();
+                for callback in &presentation_feedbacks {
+                    callback(drawable_id, presented_time);
+                }
+            });
+            drawable.add_presented_handler(&handler.copy());
+        }
+
         if self.presents_with_transaction {
+            Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
             drawable.present();
         } else {
             command_buffer.present_drawable(drawable);
+            Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
         }
         if external_surface_trace_enabled() {
@@ -771,8 +819,9 @@ impl MetalRenderer {
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer =
-            self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size)?;
+            self.draw_primitives(scene, &mut instance_buffer, drawable, viewport_size, None)?;
 
+        Self::notify_external_surfaces_submitted(scene, None);
         command_buffer.commit();
         command_buffer.wait_until_completed();
         self.instance_buffer_pool.lock().release(instance_buffer);
@@ -829,14 +878,20 @@ impl MetalRenderer {
         let target_texture = self.device.new_texture(&texture_descriptor);
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size)?;
+        let command_buffer = self.draw_primitives_to_texture(
+            scene,
+            &mut instance_buffer,
+            &target_texture,
+            size,
+            None,
+        )?;
 
         if !self.is_unified_memory {
             let blit = command_buffer.new_blit_command_encoder();
             blit.synchronize_resource(&target_texture);
             blit.end_encoding();
         }
+        Self::notify_external_surfaces_submitted(scene, None);
         command_buffer.commit();
         command_buffer.wait_until_completed();
         self.instance_buffer_pool.lock().release(instance_buffer);
@@ -900,9 +955,15 @@ impl MetalRenderer {
             .expect("just ensured the render target exists");
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
-        let command_buffer =
-            self.draw_primitives_to_texture(scene, &mut instance_buffer, &target_texture, size)?;
+        let command_buffer = self.draw_primitives_to_texture(
+            scene,
+            &mut instance_buffer,
+            &target_texture,
+            size,
+            None,
+        )?;
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
+        Self::notify_external_surfaces_submitted(scene, None);
         command_buffer.commit();
         Ok(())
     }
@@ -936,8 +997,28 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         drawable: &metal::MetalDrawableRef,
         viewport_size: Size<DevicePixels>,
+        drawable_id: Option<u64>,
     ) -> Result<metal::CommandBuffer> {
-        self.draw_primitives_to_texture(scene, instance_buffer, drawable.texture(), viewport_size)
+        self.draw_primitives_to_texture(
+            scene,
+            instance_buffer,
+            drawable.texture(),
+            viewport_size,
+            drawable_id,
+        )
+    }
+
+    fn notify_external_surfaces_submitted(scene: &Scene, drawable_id: Option<u64>) {
+        for surface in &scene.surfaces {
+            if let SurfaceSource::ExternalMetal(external) = &surface.source {
+                (external.on_gpu_submitted)();
+                if let (Some(drawable_id), Some((submitted, _))) =
+                    (drawable_id, external.gpu_sampling_feedback_callbacks())
+                {
+                    submitted(drawable_id);
+                }
+            }
+        }
     }
 
     /// Releases external surface textures that recent frames have not drawn,
@@ -960,6 +1041,7 @@ impl MetalRenderer {
         instance_buffer: &mut InstanceBuffer,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        drawable_id: Option<u64>,
     ) -> Result<metal::CommandBuffer> {
         self.prepare_intermediate_textures(scene, viewport_size);
         self.release_idle_external_surfaces();
@@ -985,6 +1067,11 @@ impl MetalRenderer {
                 let completion = ConcreteBlock::new(move |_| {
                     let _keep_resource_alive_until_gpu_completion = &external.image_buffer;
                     (external.on_gpu_complete)();
+                    if let (Some(drawable_id), Some((_, completed))) =
+                        (drawable_id, external.gpu_sampling_feedback_callbacks())
+                    {
+                        completed(drawable_id);
+                    }
                     if external_surface_trace_enabled() {
                         eprintln!(
                             "[GPUI-CE/ExternalMetal] command buffer completed resource={} gen={} iosurface={}",
@@ -1001,9 +1088,10 @@ impl MetalRenderer {
         let mut instance_offset = 0;
         let scene_uniforms = SceneUniforms::new(viewport_size);
 
-        // Filters and opacity groups sample offscreen textures. Owned clones keep those
-        // targets independent of mutable renderer calls such as surface painting.
-        let use_offscreen = scene.requires_offscreen_rendering();
+        // Filter and opacity groups render into isolated targets. Owned clones
+        // keep those targets independent of mutable renderer calls; only
+        // backdrop filters need the root scene as a sampleable texture.
+        let use_offscreen = scene.render_plan().requirements().backdrop_filter_count > 0;
         let scene_color_owned = self.scene_color_texture.clone();
         let blur_ping_owned = self.blur_ping_texture.clone();
         let blur_pong_owned = self.blur_pong_texture.clone();
@@ -1294,12 +1382,6 @@ impl MetalRenderer {
                 location: 0,
                 length: instance_offset as NSUInteger,
             });
-        }
-
-        for surface in &scene.surfaces {
-            if let SurfaceSource::ExternalMetal(external) = &surface.source {
-                (external.on_gpu_submitted)();
-            }
         }
 
         Ok(command_buffer.to_owned())
