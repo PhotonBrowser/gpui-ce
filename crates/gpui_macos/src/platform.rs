@@ -1144,9 +1144,8 @@ impl Platform for MacPlatform {
         // this event has returned, using common modes so it also works when
         // the caller is already inside a modal or tracking loop.
         let show_menu_state = Rc::new(RefCell::new(Some((anchor, context_menu, chosen_tx))));
-        let show_menu_state_clone = show_menu_state.clone();
         let show_menu = RcBlock::new(move || {
-            let Some((anchor, context_menu, chosen_tx)) = show_menu_state_clone.borrow_mut().take()
+            let Some((anchor, context_menu, chosen_tx)) = show_menu_state.borrow_mut().take()
             else {
                 return;
             };

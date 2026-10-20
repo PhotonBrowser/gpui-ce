@@ -763,7 +763,7 @@ impl MetalRenderer {
             .collect::<Vec<_>>();
         if !presentation_feedbacks.is_empty() {
             let handler = ConcreteBlock::new(move |drawable: &metal::DrawableRef| {
-                let drawable_id = drawable.drawable_id() as u64;
+                let drawable_id = drawable.drawable_id();
                 let presented_time = drawable.presented_time();
                 for callback in &presentation_feedbacks {
                     callback(drawable_id, presented_time);

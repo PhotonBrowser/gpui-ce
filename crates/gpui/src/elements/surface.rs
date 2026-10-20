@@ -160,10 +160,14 @@ pub struct ExternalMetalSurface {
     /// Live diagnostics gate. When false, the Metal renderer does not install
     /// a presented handler for this surface.
     pub drawable_presentation_feedback_enabled: Option<Arc<AtomicBool>>,
-    /// Optional command-buffer feedback for an actual window drawable. The
+    /// Called when a command buffer sampling this surface is submitted. The
     /// ID is that drawable's Metal identity, shared with presentation feedback.
     pub on_gpu_sampling_submitted: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Called when the GPU finishes sampling this surface for a drawable,
+    /// using the same Metal identity as the submission callback.
     pub on_gpu_sampling_completed: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    /// Live gate for sampling callbacks. When false, the renderer does not
+    /// install them for this surface.
     pub gpu_sampling_feedback_enabled: Option<Arc<AtomicBool>>,
 }
 
@@ -263,6 +267,7 @@ impl ExternalMetalSurface {
         self
     }
 
+    /// Returns the presentation callback if it was registered and feedback is enabled.
     pub fn drawable_presentation_callback(&self) -> Option<Arc<dyn Fn(u64, f64) + Send + Sync>> {
         if !self
             .drawable_presentation_feedback_enabled
@@ -274,6 +279,7 @@ impl ExternalMetalSurface {
         self.on_drawable_presented.clone()
     }
 
+    /// Returns the sampling callbacks if they were registered and feedback is enabled.
     pub fn gpu_sampling_feedback_callbacks(
         &self,
     ) -> Option<(
