@@ -1412,8 +1412,8 @@ pub trait InteractiveElement: Sized {
         self
     }
 
-    /// DEPRECATED: use [`on_drag_over`].
     /// Apply the given style when the given data type is dragged over this element
+    #[deprecated(note = "use [`on_drag_over`]")]
     fn drag_over<S: 'static>(
         mut self,
         f: impl 'static + Fn(StyleRefinement, &S, &mut Window, &mut App) -> StyleRefinement,
