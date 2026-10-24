@@ -33,6 +33,27 @@ use gpui::*;
 
 pub(crate) struct WindowsWindow(pub Rc<WindowsWindowInner>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WindowBackdrop {
+    Opaque,
+    Transparent,
+    Blurred,
+    Mica,
+    MicaAlt,
+}
+
+fn window_backdrop(appearance: WindowBackgroundAppearance) -> WindowBackdrop {
+    match appearance {
+        WindowBackgroundAppearance::Opaque => WindowBackdrop::Opaque,
+        WindowBackgroundAppearance::Transparent => WindowBackdrop::Transparent,
+        WindowBackgroundAppearance::Blurred | WindowBackgroundAppearance::LiquidGlass => {
+            WindowBackdrop::Blurred
+        }
+        WindowBackgroundAppearance::MicaBackdrop => WindowBackdrop::Mica,
+        WindowBackgroundAppearance::MicaAltBackdrop => WindowBackdrop::MicaAlt,
+    }
+}
+
 impl std::ops::Deref for WindowsWindow {
     type Target = WindowsWindowInner;
 
@@ -926,21 +947,21 @@ impl PlatformWindow for WindowsWindow {
 
         // using Dwm APIs for Mica and MicaAlt backdrops.
         // others follow the set_window_composition_attribute approach
-        match background_appearance {
-            WindowBackgroundAppearance::Opaque => {
+        match window_backdrop(background_appearance) {
+            WindowBackdrop::Opaque => {
                 set_window_composition_attribute(hwnd, None, 0);
             }
-            WindowBackgroundAppearance::Transparent => {
+            WindowBackdrop::Transparent => {
                 set_window_composition_attribute(hwnd, None, 2);
             }
-            WindowBackgroundAppearance::Blurred => {
+            WindowBackdrop::Blurred => {
                 set_window_composition_attribute(hwnd, Some((0, 0, 0, 0)), 4);
             }
-            WindowBackgroundAppearance::MicaBackdrop => {
+            WindowBackdrop::Mica => {
                 // DWMSBT_MAINWINDOW => MicaBase
                 dwm_set_window_composition_attribute(hwnd, 2);
             }
-            WindowBackgroundAppearance::MicaAltBackdrop => {
+            WindowBackdrop::MicaAlt => {
                 // DWMSBT_TABBEDWINDOW => MicaAlt
                 dwm_set_window_composition_attribute(hwnd, 4);
             }
@@ -1784,10 +1805,18 @@ fn character_palette_inputs(held_modifiers: &[VIRTUAL_KEY], win_held: bool) -> V
 
 #[cfg(test)]
 mod tests {
-    use super::{ClickState, character_palette_inputs};
-    use gpui::{DevicePixels, MouseButton, point};
+    use super::{ClickState, WindowBackdrop, character_palette_inputs, window_backdrop};
+    use gpui::{DevicePixels, MouseButton, WindowBackgroundAppearance, point};
     use std::time::Duration;
     use windows::Win32::UI::Input::KeyboardAndMouse::*;
+
+    #[test]
+    fn liquid_glass_uses_the_blurred_fallback_on_windows() {
+        assert_eq!(
+            window_backdrop(WindowBackgroundAppearance::LiquidGlass),
+            WindowBackdrop::Blurred
+        );
+    }
 
     #[test]
     fn character_palette_preserves_held_modifiers() {
