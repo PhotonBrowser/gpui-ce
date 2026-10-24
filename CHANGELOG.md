@@ -9,7 +9,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Highlights
 (only filled out when preparing the release)
 
-### Breaking Changes
+### Breaking changes
+- `Application::run` has been migrated to use the same behaviour as `Application::run_embedded`.
 - Switched text system to [parley](https://github.com/linebender/parley). [#267](https://github.com/gpui-ce/gpui-ce/pull/267)
 - Replaced `DefiniteLength::Fraction(f32)` with `DefiniteLength::Relative(Relative)`. [#230](https://github.com/gpui-ce/gpui-ce/pull/230), [#255](https://github.com/gpui-ce/gpui-ce/pull/255)
 - Renamed `Window::activate_window` to `Window::activate`. [#272](https://github.com/gpui-ce/gpui-ce/pull/272)
@@ -69,7 +70,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `WindowOptions::window_background` in favor of `macos_window_background`, `windows_window_background`, `linux_window_background`, and `web_window_background`. [#299](https://github.com/gpui-ce/gpui-ce/pull/299)
 
 ### Fixes
-- EditableText selection remaining visible after losing focus. [#267](https://github.com/gpui-ce/gpui-ce/pull/267)
+- EditableText selection remaining visible after losing focus. [#250](https://github.com/gpui-ce/gpui-ce/issues/250), [#267](https://github.com/gpui-ce/gpui-ce/pull/267)
 - Proportional pixel snapping for fractional padding on automatically sized axes. [#217](https://github.com/gpui-ce/gpui-ce/pull/217)
 - Linux-to-macOS cross-compilation in gpui_media. [#232](https://github.com/gpui-ce/gpui-ce/pull/232)
 - Duplicate characters during web IME composition. [#236](https://github.com/gpui-ce/gpui-ce/pull/236)
@@ -80,6 +81,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Deprecations
 - `quad`, `fill`, & `outline`. [#338](https://github.com/gpui-ce/gpui-ce/pull/338)
+- `Application::run_embedded` in favor of `Application::run`, as the latter now has the same behaviour as the former. [#364](https://github.com/gpui-ce/gpui-ce/pull/364)
 - `hover`, `group_hover`, `focus`, `in_focus`, `focus_visible`, `active`, `group_active`, and `group_drag_over` methods in favor of variants with a `_style` suffix. [#339](https://github.com/gpui-ce/gpui-ce/pull/339)
 - `InteractiveElement::drag_over` in favor of `on_drag_over`. [#227](https://github.com/gpui-ce/gpui-ce/pull/227)
 
