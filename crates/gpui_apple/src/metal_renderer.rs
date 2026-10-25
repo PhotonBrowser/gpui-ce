@@ -1,11 +1,13 @@
+use crate::drawable_queue::DrawableQueue;
 use crate::metal_atlas::MetalAtlas;
 use anyhow::Result;
 use block::ConcreteBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
-    AtlasTextureId, Bounds, Corners, DevicePixels, ExternalTextureIdentity, FilterRenderTarget,
-    MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PaintSurface, Path, PolychromeSprite, PrimitiveBatch,
-    Quad, RenderCommand, ScaledPixels, Scene, Shadow, Size, SurfaceSource, Underline, size,
+    AtlasTextureId, BackgroundExecutor, Bounds, Corners, DevicePixels, ExternalTextureIdentity,
+    FilterRenderTarget, MAX_FILTER_GROUP_DEPTH, MonochromeSprite, PaintSurface, Path,
+    PolychromeSprite, PrimitiveBatch, Quad, RenderCommand, ScaledPixels, Scene, Shadow, Size,
+    SurfaceSource, Underline, size,
 };
 use gpui_render::{
     TargetStack,
@@ -48,8 +50,9 @@ fn external_surface_trace_enabled() -> bool {
 // Use 4x MSAA, all devices support it.
 // https://developer.apple.com/documentation/metal/mtldevice/1433355-supportstexturesamplecount
 const PATH_SAMPLE_COUNT: u32 = 4;
-/// Two drawables bound per-window surfaces while preserving double buffering.
-const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 2;
+/// Displayed, submitted, and prepared frames need separate drawables so
+/// acquisition can finish before the next display tick.
+const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 3;
 
 // Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
 // binding at 2, Naga's runtime-array sizes buffer at 3.
@@ -162,7 +165,7 @@ pub fn new_window_layer(transparent: bool) -> metal::MetalLayer {
     // Reborrow its Objective-C object as the generated objc2 class to keep
     // selector encodings and the autoresizing mask type checked here.
     let layer_object = unsafe { &*(layer.as_ptr() as *const Objc2CAMetalLayer) };
-    layer_object.setAllowsNextDrawableTimeout(false);
+    layer_object.setAllowsNextDrawableTimeout(true);
     layer_object.setNeedsDisplayOnBoundsChange(true);
     layer_object.setAutoresizingMask(
         CAAutoresizingMask::LayerWidthSizable | CAAutoresizingMask::LayerHeightSizable,
@@ -244,6 +247,7 @@ impl InstanceBufferPool {
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
+    drawables: DrawableQueue<metal::MetalDrawable>,
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
@@ -518,6 +522,7 @@ impl MetalRenderer {
         Self {
             device,
             layer,
+            drawables: DrawableQueue::default(),
             presents_with_transaction: false,
             is_apple_gpu,
             is_unified_memory,
@@ -587,7 +592,12 @@ impl MetalRenderer {
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
         if let Some(layer) = &self.layer {
-            layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
+            let drawable_size = CGSize::new(size.width.0 as f64, size.height.0 as f64);
+            let previous = layer.drawable_size();
+            if previous.width != drawable_size.width || previous.height != drawable_size.height {
+                self.drawables.invalidate();
+                layer.set_drawable_size(drawable_size);
+            }
         }
         self.update_intermediate_texture_size(size);
     }
@@ -707,18 +717,28 @@ impl MetalRenderer {
         }
     }
 
-    pub fn destroy(&self) {
-        // nothing to do
+    pub fn destroy(&mut self) {
+        self.drawables.clear();
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    fn request_drawable(&mut self, executor: &BackgroundExecutor) {
+        let Some(layer) = self.layer.clone() else {
+            return;
+        };
+        self.drawables.request(executor, move || {
+            objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
+        });
+    }
+
+    /// Returns whether presentation must be retried with the latest scene.
+    pub fn draw(&mut self, scene: &Scene, executor: &BackgroundExecutor) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return false;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -726,16 +746,25 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return;
+        if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
+            self.drawables.invalidate();
+            return false;
+        }
+        let Some(drawable) = self.drawables.take() else {
+            self.request_drawable(executor);
+            return true;
         };
-        let drawable_id = drawable.drawable_id() as u64;
+        // A resize can overlap acquisition. Never encode the new scene into
+        // an old-size drawable, including one acquired during the resize.
+        if drawable.texture().width() != viewport_size.width.0 as u64
+            || drawable.texture().height() != viewport_size.height.0 as u64
+        {
+            drop(drawable);
+            self.request_drawable(executor);
+            return true;
+        }
+        let drawable = drawable.as_ref();
+        let drawable_id = drawable.drawable_id();
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_primitives(
@@ -748,7 +777,7 @@ impl MetalRenderer {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render pre-sized scene: {error}");
-                return;
+                return false;
             }
         };
         self.release_instance_buffer_when_complete(&command_buffer, instance_buffer);
@@ -794,6 +823,10 @@ impl MetalRenderer {
                 }
             }
         }
+        // Acquire ahead of the next frame without ever waiting in AppKit's
+        // event loop. The queue retains at most one prepared drawable.
+        self.request_drawable(executor);
+        false
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
