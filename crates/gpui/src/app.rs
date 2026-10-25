@@ -148,7 +148,7 @@ impl Drop for AppRefMut<'_> {
 /// You won't interact with this type much outside of initial configuration and startup.
 pub struct Application(Rc<AppCell>);
 
-/// A strong handle to an [`Application`] started with [`Application::run_embedded`].
+/// A strong handle to an [`Application`] started with [`Application::run`].
 ///
 /// Dropping this handle releases the app, so an embedder must hold it for as long as the
 /// app should run. While held, it is the embedder's entry point back into GPUI each time
@@ -264,9 +264,12 @@ impl Application {
         self
     }
 
-    /// Start the application. The provided callback will be called once the
-    /// app is fully launched.
-    pub fn run<F>(self, on_finish_launching: F)
+    /// Start the application and call `on_finish_launching` once it has launched.
+    ///
+    /// This blocks until shutdown on standalone native platforms. Web and embedded
+    /// platforms return immediately. Keep the returned [`ApplicationHandle`] alive
+    /// for as long as the app should run. The handle also lets the host update the app.
+    pub fn run<F>(self, on_finish_launching: F) -> ApplicationHandle
     where
         F: 'static + FnOnce(&mut App),
     {
@@ -279,38 +282,22 @@ impl Application {
 
         let this = self.0.clone();
         let platform = self.0.borrow().platform.clone();
+
         platform.run(Box::new(move || {
             let cx = &mut *this.borrow_mut();
             on_finish_launching(cx);
         }));
 
-        // Native platform run loops block until shutdown, keeping `self` alive for the
-        // application's lifetime. The web platform schedules startup and returns
-        // immediately, so retain the application until the browser tears down the page.
-        #[cfg(target_family = "wasm")]
-        std::mem::forget(self);
+        ApplicationHandle { app: self.0 }
     }
 
-    /// Start the application for an embedder that drives the run loop itself.
-    ///
-    /// On ordinary platforms `Platform::run` blocks for the lifetime of the app, and the
-    /// app state is kept alive by [`Application::run`]'s stack frame. Embedded platforms —
-    /// where the run loop belongs to someone else, e.g. GPUI compiled into a Wasm guest,
-    /// or a GPUI view hosted inside a foreign native application — implement
-    /// `Platform::run` to invoke the launch callback and return immediately. This method
-    /// supports that shape: it returns an [`ApplicationHandle`] that keeps the app alive
-    /// and lets the embedder re-enter it whenever the external run loop yields control.
+    /// Deprecated alias for [`Application::run`].
+    #[deprecated(note = "Use [Application::run] instead.")]
     pub fn run_embedded<F>(self, on_finish_launching: F) -> ApplicationHandle
     where
         F: 'static + FnOnce(&mut App),
     {
-        let this = self.0.clone();
-        let platform = self.0.borrow().platform.clone();
-        platform.run(Box::new(move || {
-            let cx = &mut *this.borrow_mut();
-            on_finish_launching(cx);
-        }));
-        ApplicationHandle { app: self.0 }
+        self.run(on_finish_launching)
     }
 
     /// Register a handler to be invoked when the platform instructs the application
@@ -3244,17 +3231,75 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
+    use super::{Application, CursorHideMode};
     use std::{
         cell::{Cell, RefCell},
         ffi::OsString,
         path::PathBuf,
         rc::Rc,
+        sync::Arc,
     };
 
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
-    use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
+    use crate::{
+        AppContext, BackgroundExecutor, Context, Empty, ForegroundExecutor, IntoElement, Render,
+        TestAppContext, TestDispatcher, TestPlatform, Window,
+    };
+
+    fn test_application() -> (Application, TestDispatcher) {
+        let dispatcher = TestDispatcher::new(0);
+        let platform_dispatcher = Arc::new(dispatcher.clone());
+        let platform = TestPlatform::new(
+            BackgroundExecutor::new(platform_dispatcher.clone()),
+            ForegroundExecutor::new(platform_dispatcher),
+        );
+
+        (Application::with_platform(platform), dispatcher)
+    }
+
+    #[test]
+    fn run_handle_owns_application_after_launch() {
+        let (application, dispatcher) = test_application();
+        let launch_count = Rc::new(Cell::new(0));
+        let callback_count = launch_count.clone();
+        let handle = application.run(move |cx| {
+            callback_count.set(callback_count.get() + 1);
+            cx.set_cursor_hide_mode(CursorHideMode::Never);
+        });
+        let async_app = handle.to_async();
+
+        assert_eq!(launch_count.get(), 0);
+        dispatcher.run_until_parked();
+
+        assert_eq!(launch_count.get(), 1);
+        assert_eq!(
+            handle.update(|cx| cx.cursor_hide_mode()),
+            CursorHideMode::Never
+        );
+
+        drop(handle);
+
+        assert!(async_app.app.upgrade().is_none());
+    }
+
+    #[test]
+    fn run_releases_application_after_launch_when_handle_was_dropped() {
+        let (application, dispatcher) = test_application();
+        let launched = Rc::new(Cell::new(false));
+        let callback_launched = launched.clone();
+        let handle = application.run(move |_cx| callback_launched.set(true));
+        let async_app = handle.to_async();
+
+        drop(handle);
+
+        assert!(async_app.app.upgrade().is_some());
+        dispatcher.run_until_parked();
+
+        assert!(launched.get());
+        assert!(async_app.app.upgrade().is_none());
+    }
 
     struct RenderCounter(Rc<Cell<usize>>);
 
