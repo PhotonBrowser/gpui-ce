@@ -41,7 +41,11 @@ use parking_lot::Mutex;
 use smallvec::SmallVec;
 use wgsl_rs::std::{vec2f, vec4f};
 
-use std::{cell::Cell, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    mem, ptr,
+    sync::{Arc, OnceLock},
+};
 
 fn external_surface_trace_enabled() -> bool {
     std::env::var_os("GPUI_EXTERNAL_SURFACE_TRACE").is_some()
@@ -264,18 +268,15 @@ pub struct MetalRenderer {
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
     smoothed_polychrome_sprites_pipeline_state: metal::RenderPipelineState,
-    surfaces_pipeline_state: metal::RenderPipelineState,
-    // Blur pipelines: downsample (no blend, also used for the final blit), separable gaussian
-    // (no blend), and composite (alpha blend into a rounded rect), from shared shader sources.
-    blur_downsample_pipeline_state: metal::RenderPipelineState,
-    blur_pipeline_state: metal::RenderPipelineState,
-    blur_composite_pipeline_state: metal::RenderPipelineState,
-    smoothed_blur_composite_pipeline_state: metal::RenderPipelineState,
+    /// Compiled only when the scene first contains an external Metal surface.
+    surfaces_pipeline_state: OnceLock<metal::RenderPipelineState>,
+    /// Only build blur pipelines for scenes that actually use blur filters.
+    blur_pipeline_states: OnceLock<BlurPipelineStates>,
     sampler: metal::SamplerState,
     #[allow(clippy::arc_with_non_send_sync)]
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
-    core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    core_video_texture_cache: OnceLock<CVMetalTextureCache>,
     /// Imported external surfaces, with the frame each was last drawn in.
     external_surface_textures: std::collections::HashMap<
         ExternalTextureIdentity,
@@ -300,6 +301,14 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// Blur downsample/gaussian passes overwrite their target; composites preserve its contents.
+struct BlurPipelineStates {
+    downsample: metal::RenderPipelineState,
+    gaussian: metal::RenderPipelineState,
+    composite: metal::RenderPipelineState,
+    smoothed_composite: metal::RenderPipelineState,
 }
 
 impl MetalRenderer {
@@ -467,47 +476,6 @@ impl MetalRenderer {
             smoothed_polychrome_shader,
             MTLPixelFormat::BGRA8Unorm,
         );
-        let (surfaces_shader, surfaces_library) = pipeline("surfaces");
-        // External surfaces contain premultiplied pixels (including the BGRA
-        // IOSurfaces supplied by Photon). Blend their sampled colors without
-        // multiplying by alpha a second time.
-        let surfaces_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &surfaces_library,
-            surfaces_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (blur_downsample_shader, blur_downsample_library) = pipeline("blur_downsample");
-        let blur_downsample_pipeline_state = build_blur_pipeline_state(
-            &device,
-            &blur_downsample_library,
-            blur_downsample_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (blur_shader, blur_library) = pipeline("blur");
-        let blur_pipeline_state = build_blur_pipeline_state(
-            &device,
-            &blur_library,
-            blur_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        // Premultiplied blend (One / OneMinusSourceAlpha) — the composite outputs a premultiplied
-        // blurred sample; straight-alpha blending would darken the faded edges.
-        let (blur_composite_shader, blur_composite_library) = pipeline("blur_composite");
-        let blur_composite_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &blur_composite_library,
-            blur_composite_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
-        let (smoothed_blur_composite_shader, smoothed_blur_composite_library) =
-            pipeline("smoothed_blur_composite");
-        let smoothed_blur_composite_pipeline_state = build_path_sprite_pipeline_state(
-            &device,
-            &smoothed_blur_composite_library,
-            smoothed_blur_composite_shader,
-            MTLPixelFormat::BGRA8Unorm,
-        );
 
         let sampler_descriptor = SamplerDescriptor::new();
         sampler_descriptor.set_min_filter(metal::MTLSamplerMinMagFilter::Linear);
@@ -516,9 +484,6 @@ impl MetalRenderer {
 
         let command_queue = device.new_command_queue();
         let sprite_atlas = Arc::new(MetalAtlas::new(device.clone(), is_apple_gpu));
-        let core_video_texture_cache =
-            CVMetalTextureCache::new(None, device.clone(), None).unwrap();
-
         Self {
             device,
             layer,
@@ -538,15 +503,12 @@ impl MetalRenderer {
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
             smoothed_polychrome_sprites_pipeline_state,
-            surfaces_pipeline_state,
-            blur_downsample_pipeline_state,
-            blur_pipeline_state,
-            blur_composite_pipeline_state,
-            smoothed_blur_composite_pipeline_state,
+            surfaces_pipeline_state: OnceLock::new(),
+            blur_pipeline_states: OnceLock::new(),
             sampler,
             instance_buffer_pool,
             sprite_atlas,
-            core_video_texture_cache,
+            core_video_texture_cache: OnceLock::new(),
             external_surface_textures: std::collections::HashMap::new(),
             external_surface_frame: 0,
             path_intermediate_texture: None,
@@ -560,6 +522,89 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+        }
+    }
+
+    fn surfaces_pipeline_state(&self) -> &metal::RenderPipelineState {
+        self.surfaces_pipeline_state.get_or_init(|| {
+            let shader = native_shader("surfaces");
+            let library = self
+                .device
+                .new_library_with_source(shader.msl, &metal::CompileOptions::new())
+                .unwrap_or_else(|error| panic!("error building render shader library: {error}"));
+            // External surfaces contain premultiplied pixels (including Photon BGRA IOSurfaces).
+            build_path_sprite_pipeline_state(
+                &self.device,
+                &library,
+                shader,
+                MTLPixelFormat::BGRA8Unorm,
+            )
+        })
+    }
+
+    fn blur_pipeline_states(&self) -> &BlurPipelineStates {
+        self.blur_pipeline_states
+            .get_or_init(|| Self::build_blur_pipeline_states(&self.device))
+    }
+
+    fn build_blur_pipeline_states(device: &metal::DeviceRef) -> BlurPipelineStates {
+        let mut libraries: Vec<(&'static str, metal::Library)> = Vec::new();
+        let mut library_for = |source: &'static str| -> metal::Library {
+            if let Some((_, library)) = libraries
+                .iter()
+                .find(|(registered, _)| *registered == source)
+            {
+                return library.clone();
+            }
+            let library = device
+                .new_library_with_source(source, &metal::CompileOptions::new())
+                .unwrap_or_else(|error| panic!("error building blur shader library: {error}"));
+            libraries.push((source, library.clone()));
+            library
+        };
+
+        let mut pipeline = |label: &str| -> (&'static NativeShader, metal::Library) {
+            let shader = native_shader(label);
+            (shader, library_for(shader.msl))
+        };
+
+        let (downsample_shader, downsample_library) = pipeline("blur_downsample");
+        let downsample = build_blur_pipeline_state(
+            device,
+            &downsample_library,
+            downsample_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let (gaussian_shader, gaussian_library) = pipeline("blur");
+        let gaussian = build_blur_pipeline_state(
+            device,
+            &gaussian_library,
+            gaussian_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        // Premultiplied blend (One / OneMinusSourceAlpha) — the composite outputs premultiplied
+        // pixels; straight-alpha blending would darken the faded edges.
+        let (composite_shader, composite_library) = pipeline("blur_composite");
+        let composite = build_path_sprite_pipeline_state(
+            device,
+            &composite_library,
+            composite_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let (smoothed_composite_shader, smoothed_composite_library) =
+            pipeline("smoothed_blur_composite");
+        let smoothed_composite = build_path_sprite_pipeline_state(
+            device,
+            &smoothed_composite_library,
+            smoothed_composite_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+
+        BlurPipelineStates {
+            downsample,
+            gaussian,
+            composite,
+            smoothed_composite,
         }
     }
 
@@ -1064,7 +1109,9 @@ impl MetalRenderer {
         self.external_surface_textures
             .retain(|_, (_, last_drawn)| frame - *last_drawn <= EXTERNAL_SURFACE_IDLE_FRAMES);
         if self.external_surface_textures.len() != count {
-            self.core_video_texture_cache.flush(0);
+            if let Some(cache) = self.core_video_texture_cache.get() {
+                cache.flush(0);
+            }
         }
     }
 
@@ -1388,7 +1435,7 @@ impl MetalRenderer {
         if use_offscreen && scene_color_owned.is_some() {
             self.run_metal_blur_pass(
                 command_buffer,
-                &self.blur_downsample_pipeline_state,
+                &self.blur_pipeline_states().downsample,
                 texture,
                 scene_color,
                 viewport_size,
@@ -1533,7 +1580,7 @@ impl MetalRenderer {
                 // Downsample source -> ping, then separable gaussian ping -> pong -> ping.
                 self.run_metal_blur_pass(
                     command_buffer,
-                    &self.blur_downsample_pipeline_state,
+                    &self.blur_pipeline_states().downsample,
                     ping,
                     source,
                     blur_viewport_size,
@@ -1551,7 +1598,7 @@ impl MetalRenderer {
                 ] {
                     self.run_metal_blur_pass(
                         command_buffer,
-                        &self.blur_pipeline_state,
+                        &self.blur_pipeline_states().gaussian,
                         target,
                         source,
                         blur_viewport_size,
@@ -1594,9 +1641,9 @@ impl MetalRenderer {
             },
         );
         let pipeline = if composite_uniforms.corner_smoothing > 0.0 {
-            &self.smoothed_blur_composite_pipeline_state
+            &self.blur_pipeline_states().smoothed_composite
         } else {
-            &self.blur_composite_pipeline_state
+            &self.blur_pipeline_states().composite
         };
         encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(encoder, scene_uniforms);
@@ -2078,7 +2125,11 @@ impl MetalRenderer {
         scene_uniforms: &SceneUniforms,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> bool {
-        command_encoder.set_render_pipeline_state(&self.surfaces_pipeline_state);
+        if surfaces.is_empty() {
+            return true;
+        }
+
+        command_encoder.set_render_pipeline_state(self.surfaces_pipeline_state());
         bind_scene_uniforms(command_encoder, scene_uniforms);
         command_encoder.set_fragment_sampler_state(SAMPLER_SLOT, Some(&self.sampler));
 
@@ -2120,7 +2171,11 @@ impl MetalRenderer {
                             descriptor.identity.iosurface_id
                         );
                     }
-                    let imported = match self.core_video_texture_cache.create_texture_from_image(
+                    let texture_cache = self.core_video_texture_cache.get_or_init(|| {
+                        CVMetalTextureCache::new(None, self.device.clone(), None)
+                            .expect("could not create CoreVideo Metal texture cache")
+                    });
+                    let imported = match texture_cache.create_texture_from_image(
                         external.image_buffer.as_concrete_TypeRef(),
                         None,
                         MTLPixelFormat::BGRA8Unorm,
@@ -2242,8 +2297,11 @@ impl MetalRenderer {
                 kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
             );
 
-            let y_texture = self
-                .core_video_texture_cache
+            let texture_cache = self.core_video_texture_cache.get_or_init(|| {
+                CVMetalTextureCache::new(None, self.device.clone(), None)
+                    .expect("could not create CoreVideo Metal texture cache")
+            });
+            let y_texture = texture_cache
                 .create_texture_from_image(
                     image_buffer.as_concrete_TypeRef(),
                     None,
@@ -2253,8 +2311,7 @@ impl MetalRenderer {
                     0,
                 )
                 .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
+            let cb_cr_texture = texture_cache
                 .create_texture_from_image(
                     image_buffer.as_concrete_TypeRef(),
                     None,
@@ -2551,6 +2608,27 @@ mod tests {
         pattern_slash, px, solid_background, white,
     };
     use std::borrow::Cow;
+
+    #[test]
+    fn optional_pipelines_are_created_on_first_use() {
+        let pool = Arc::new(Mutex::new(InstanceBufferPool::default()));
+        let renderer = MetalRenderer::new_headless(pool);
+
+        assert!(renderer.surfaces_pipeline_state.get().is_none());
+        assert!(renderer.blur_pipeline_states.get().is_none());
+        assert!(renderer.core_video_texture_cache.get().is_none());
+
+        let blur_pipelines = renderer.blur_pipeline_states();
+        assert!(std::ptr::eq(
+            blur_pipelines,
+            renderer.blur_pipeline_states()
+        ));
+        let surfaces_pipeline = renderer.surfaces_pipeline_state();
+        assert!(std::ptr::eq(
+            surfaces_pipeline,
+            renderer.surfaces_pipeline_state()
+        ));
+    }
 
     #[test]
     fn intermediate_textures_follow_scene_requirements() {
