@@ -57,6 +57,9 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Displayed, submitted, and prepared frames need separate drawables so
 /// acquisition can finish before the next display tick.
 const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 3;
+/// How long a frame waits for a drawable still being acquired: most of a
+/// 60 Hz display cycle, so a briefly busy pool still presents this cycle.
+const DRAWABLE_WAIT: std::time::Duration = std::time::Duration::from_millis(12);
 
 // Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
 // binding at 2, Naga's runtime-array sizes buffer at 3.
@@ -795,7 +798,10 @@ impl MetalRenderer {
             self.drawables.invalidate();
             return false;
         }
-        let Some(drawable) = self.drawables.take() else {
+        // Acquisition normally finishes off this thread before the frame. When
+        // it is late, wait for it a while rather than skip the display cycle;
+        // a skipped cycle halves the frame rate while drawables are busy.
+        let Some(drawable) = self.drawables.take_within(DRAWABLE_WAIT) else {
             self.request_drawable(executor);
             return true;
         };
@@ -810,6 +816,11 @@ impl MetalRenderer {
         }
         let drawable = drawable.as_ref();
         let drawable_id = drawable.drawable_id();
+
+        // Start acquiring the next drawable while this scene is encoded. If
+        // CAMetalLayer needs to wait for an in-flight drawable, that wait can
+        // overlap CPU work instead of delaying the next window frame.
+        self.request_drawable(executor);
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_primitives(
@@ -868,9 +879,6 @@ impl MetalRenderer {
                 }
             }
         }
-        // Acquire ahead of the next frame without ever waiting in AppKit's
-        // event loop. The queue retains at most one prepared drawable.
-        self.request_drawable(executor);
         false
     }
 

@@ -1,5 +1,8 @@
 use gpui::{BackgroundExecutor, Task};
-use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::{
+    sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError},
+    time::Duration,
+};
 
 /// One acquisition in flight, retaining at most one prepared drawable.
 pub(crate) struct DrawableQueue<T> {
@@ -44,12 +47,27 @@ impl<T: Send + 'static> DrawableQueue<T> {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn take(&mut self) -> Option<T> {
+        self.take_within(Duration::ZERO)
+    }
+
+    /// Takes the drawable, waiting up to `timeout` for an acquisition still
+    /// in flight. A late drawable then costs part of a frame, not a whole one.
+    pub(crate) fn take_within(&mut self, timeout: Duration) -> Option<T> {
         let pending = self.pending.as_ref()?;
-        let drawable = match pending.receiver.try_recv() {
+        let result = if timeout.is_zero() {
+            pending.receiver.try_recv().map_err(|error| match error {
+                TryRecvError::Empty => RecvTimeoutError::Timeout,
+                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+            })
+        } else {
+            pending.receiver.recv_timeout(timeout)
+        };
+        let drawable = match result {
             Ok(drawable) => drawable,
-            Err(TryRecvError::Empty) => return None,
-            Err(TryRecvError::Disconnected) => None,
+            Err(RecvTimeoutError::Timeout) => return None,
+            Err(RecvTimeoutError::Disconnected) => None,
         };
         let pending = self.pending.take().expect("acquisition is pending");
         (pending.generation == self.generation)
