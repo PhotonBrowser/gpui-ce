@@ -263,6 +263,8 @@ pub struct MetalRenderer {
     /// Whether the window layer is marked opaque now. A frame with cutouts
     /// keeps it transparent, or Core Animation would show the holes black.
     layer_opaque: bool,
+    /// The cutouts in the last presented frame, as bounds and clip.
+    presented_cutouts: Vec<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
@@ -513,6 +515,7 @@ impl MetalRenderer {
             is_unified_memory,
             opaque,
             layer_opaque: opaque,
+            presented_cutouts: Vec::new(),
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -823,7 +826,18 @@ impl MetalRenderer {
             self.drawables.invalidate();
             return false;
         }
-        let layer_opaque = self.opaque && !scene.quads.iter().any(|quad| quad.cutout != 0);
+        let cutouts = scene
+            .quads
+            .iter()
+            .filter(|quad| quad.cutout != 0)
+            .map(|quad| (quad.bounds, quad.content_mask.bounds))
+            .collect::<Vec<_>>();
+        // Native content shown through a cutout is placed in this same turn,
+        // in a Core Animation transaction. A drawable presented on its own
+        // reaches the screen a frame or more later, so while a cutout moves,
+        // present with that transaction to keep hole and content together.
+        let cutouts_moved = cutouts != self.presented_cutouts;
+        let layer_opaque = self.opaque && cutouts.is_empty();
         if layer_opaque != self.layer_opaque {
             self.set_layer_opaque(layer_opaque);
         }
@@ -886,7 +900,8 @@ impl MetalRenderer {
             drawable.add_presented_handler(&handler.copy());
         }
 
-        if self.presents_with_transaction {
+        self.presented_cutouts = cutouts;
+        if self.presents_with_transaction || cutouts_moved {
             Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
