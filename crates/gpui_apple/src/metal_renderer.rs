@@ -60,6 +60,10 @@ const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 3;
 /// How long a frame waits for a drawable still being acquired: most of a
 /// 60 Hz display cycle, so a briefly busy pool still presents this cycle.
 const DRAWABLE_WAIT: std::time::Duration = std::time::Duration::from_millis(12);
+/// How long a frame whose cutouts moved waits instead. Native content beneath
+/// has already moved in this turn, so a skipped frame would leave the hole
+/// behind it until the next one.
+const MOVING_CUTOUT_DRAWABLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 // Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
 // binding at 2, Naga's runtime-array sizes buffer at 3.
@@ -265,6 +269,9 @@ pub struct MetalRenderer {
     layer_opaque: bool,
     /// The cutouts in the last presented frame, as bounds and clip.
     presented_cutouts: Vec<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
+    /// Whether the window layer presents drawables with Core Animation
+    /// transactions now: while the window asks to, or while a cutout moves.
+    layer_presents_with_transaction: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
@@ -516,6 +523,7 @@ impl MetalRenderer {
             opaque,
             layer_opaque: opaque,
             presented_cutouts: Vec::new(),
+            layer_presents_with_transaction: false,
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -656,9 +664,16 @@ impl MetalRenderer {
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
+        self.set_layer_presents_with_transaction(presents_with_transaction);
+    }
+
+    /// `CAMetalLayer` joins a drawable to the current Core Animation
+    /// transaction only while this is set on the layer itself.
+    fn set_layer_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
         }
+        self.layer_presents_with_transaction = presents_with_transaction;
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -844,7 +859,12 @@ impl MetalRenderer {
         // Acquisition normally finishes off this thread before the frame. When
         // it is late, wait for it a while rather than skip the display cycle;
         // a skipped cycle halves the frame rate while drawables are busy.
-        let Some(drawable) = self.drawables.take_within(DRAWABLE_WAIT) else {
+        let drawable_wait = if cutouts_moved {
+            MOVING_CUTOUT_DRAWABLE_WAIT
+        } else {
+            DRAWABLE_WAIT
+        };
+        let Some(drawable) = self.drawables.take_within(drawable_wait) else {
             self.request_drawable(executor);
             return true;
         };
@@ -901,7 +921,11 @@ impl MetalRenderer {
         }
 
         self.presented_cutouts = cutouts;
-        if self.presents_with_transaction || cutouts_moved {
+        let presents_with_transaction = self.presents_with_transaction || cutouts_moved;
+        if presents_with_transaction != self.layer_presents_with_transaction {
+            self.set_layer_presents_with_transaction(presents_with_transaction);
+        }
+        if presents_with_transaction {
             Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
