@@ -60,10 +60,6 @@ const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 3;
 /// How long a frame waits for a drawable still being acquired: most of a
 /// 60 Hz display cycle, so a briefly busy pool still presents this cycle.
 const DRAWABLE_WAIT: std::time::Duration = std::time::Duration::from_millis(12);
-/// How long a frame whose cutouts moved waits instead. Native content beneath
-/// has already moved in this turn, so a skipped frame would leave the hole
-/// behind it until the next one.
-const MOVING_CUTOUT_DRAWABLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
 // Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
 // binding at 2, Naga's runtime-array sizes buffer at 3.
@@ -664,7 +660,10 @@ impl MetalRenderer {
 
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
-        self.set_layer_presents_with_transaction(presents_with_transaction);
+        // A window with cutouts keeps presenting with transactions; see `draw`.
+        self.set_layer_presents_with_transaction(
+            presents_with_transaction || !self.presented_cutouts.is_empty(),
+        );
     }
 
     /// `CAMetalLayer` joins a drawable to the current Core Animation
@@ -847,44 +846,55 @@ impl MetalRenderer {
             .filter(|quad| quad.cutout != 0)
             .map(|quad| (quad.bounds, quad.content_mask.bounds))
             .collect::<Vec<_>>();
-        // Native content shown through a cutout moves in the same main-thread
-        // turn, in a Core Animation transaction. A drawable presented on its
-        // own reaches the screen a frame or more later, so a window with
-        // cutouts presents with that transaction, keeping hole and content
-        // together.
-        let cutouts_moved = cutouts != self.presented_cutouts;
         let layer_opaque = self.opaque && cutouts.is_empty();
         if layer_opaque != self.layer_opaque {
             self.set_layer_opaque(layer_opaque);
         }
-        // Acquisition normally finishes off this thread before the frame. When
-        // it is late, wait for it a while rather than skip the display cycle;
-        // a skipped cycle halves the frame rate while drawables are busy.
-        let drawable_wait = if cutouts_moved {
-            MOVING_CUTOUT_DRAWABLE_WAIT
-        } else {
-            DRAWABLE_WAIT
-        };
-        let Some(drawable) = self.drawables.take_within(drawable_wait) else {
-            self.request_drawable(executor);
-            return true;
-        };
+        // Native content shown through a cutout moves in the same main-thread
+        // turn, in a Core Animation transaction, and a live resize lays the
+        // window out in one. A drawable presented on its own reaches the
+        // screen a frame or more later, so such windows present with that
+        // transaction. The layer must already be in that mode when a
+        // drawable is acquired.
+        let presents_with_transaction = self.presents_with_transaction || !cutouts.is_empty();
+        if presents_with_transaction != self.layer_presents_with_transaction {
+            self.set_layer_presents_with_transaction(presents_with_transaction);
+        }
         // A resize can overlap acquisition. Never encode the new scene into
         // an old-size drawable, including one acquired during the resize.
-        if drawable.texture().width() != viewport_size.width.0 as u64
-            || drawable.texture().height() != viewport_size.height.0 as u64
-        {
-            drop(drawable);
-            self.request_drawable(executor);
+        let fits = |drawable: &metal::MetalDrawable| {
+            drawable.texture().width() == viewport_size.width.0 as u64
+                && drawable.texture().height() == viewport_size.height.0 as u64
+        };
+        let drawable = if presents_with_transaction {
+            // A transactional frame cannot wait for a later cycle, and a
+            // drawable it presents is held until the transaction commits.
+            // Acquire on this thread, as upstream GPUI does, and keep none
+            // in reserve, which would leave too few to acquire from.
+            self.drawables.clear();
+            objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
+        } else {
+            // Acquisition normally finishes off this thread before the frame.
+            // When it is late, wait for it a while rather than skip the
+            // display cycle; a skipped cycle halves the frame rate while
+            // drawables are busy.
+            self.drawables.take_within(DRAWABLE_WAIT)
+        };
+        let Some(drawable) = drawable.filter(|drawable| fits(drawable)) else {
+            if !presents_with_transaction {
+                self.request_drawable(executor);
+            }
             return true;
-        }
+        };
         let drawable = drawable.as_ref();
         let drawable_id = drawable.drawable_id();
 
         // Start acquiring the next drawable while this scene is encoded. If
         // CAMetalLayer needs to wait for an in-flight drawable, that wait can
         // overlap CPU work instead of delaying the next window frame.
-        self.request_drawable(executor);
+        if !presents_with_transaction {
+            self.request_drawable(executor);
+        }
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_primitives(
@@ -922,14 +932,6 @@ impl MetalRenderer {
         }
 
         self.presented_cutouts = cutouts;
-        // The layer must already present with transactions when a drawable is
-        // acquired, so it does for as long as the window has cutouts, not
-        // only for the frames in which they move.
-        let presents_with_transaction =
-            self.presents_with_transaction || !self.presented_cutouts.is_empty();
-        if presents_with_transaction != self.layer_presents_with_transaction {
-            self.set_layer_presents_with_transaction(presents_with_transaction);
-        }
         if presents_with_transaction {
             Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
