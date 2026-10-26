@@ -242,6 +242,8 @@ pub enum PrimitiveBatch {
     Quads {
         range: Range<usize>,
         smoothed: bool,
+        /// Clears beneath the quads by their coverage instead of painting.
+        cutout: bool,
     },
     Paths {
         range: Range<usize>,
@@ -330,7 +332,9 @@ impl PrimitiveBatch {
                 if *smoothed { "smoothed " } else { "" },
                 range.len()
             ),
-            Self::Quads { range, smoothed } => format!(
+            Self::Quads {
+                range, smoothed, ..
+            } => format!(
                 "{}quads ({})",
                 if *smoothed { "smoothed " } else { "" },
                 range.len()

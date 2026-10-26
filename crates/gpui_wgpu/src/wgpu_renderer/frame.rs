@@ -563,9 +563,17 @@ fn encode_inline_batch(
     pass: &mut wgpu::RenderPass<'_>,
 ) -> DrawResult {
     match batch {
-        PrimitiveBatch::Quads { range, smoothed } => {
-            renderer.draw_quads(&scene.quads[range.clone()], *smoothed, instances, pass)
-        }
+        PrimitiveBatch::Quads {
+            range,
+            smoothed,
+            cutout,
+        } => renderer.draw_quads(
+            &scene.quads[range.clone()],
+            *smoothed,
+            *cutout,
+            instances,
+            pass,
+        ),
         PrimitiveBatch::Shadows { range, smoothed } => {
             renderer.draw_shadows(&scene.shadows[range.clone()], *smoothed, instances, pass)
         }

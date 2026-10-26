@@ -17,14 +17,16 @@ impl WgpuRenderer {
         &self,
         quads: &[Quad],
         smoothed: bool,
+        cutout: bool,
         instances: &mut InstanceUpload,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> frame::DrawResult {
         let pipelines = &self.resources().pipelines;
-        let pipeline = if smoothed {
-            &pipelines.smoothed_quads
-        } else {
-            &pipelines.quads
+        let pipeline = match (smoothed, cutout) {
+            (false, false) => &pipelines.quads,
+            (true, false) => &pipelines.smoothed_quads,
+            (false, true) => &pipelines.cutout_quads,
+            (true, true) => &pipelines.smoothed_cutout_quads,
         };
         self.draw_instances(quads, pipeline, instances, pass)
     }

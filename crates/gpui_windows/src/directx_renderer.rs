@@ -564,9 +564,12 @@ impl DirectXRenderer {
                 RenderCommand::Batch(PrimitiveBatch::Shadows { range, smoothed }) => {
                     self.draw_shadows(instance_range(range)?, *smoothed)
                 }
-                RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => {
-                    self.draw_quads(instance_range(range)?, *smoothed)
-                }
+                // DirectX has no cutout pipeline yet; a cutout leaves the
+                // area as it was painted, as `Window::paint_cutout` allows.
+                RenderCommand::Batch(PrimitiveBatch::Quads { cutout: true, .. }) => Ok(()),
+                RenderCommand::Batch(PrimitiveBatch::Quads {
+                    range, smoothed, ..
+                }) => self.draw_quads(instance_range(range)?, *smoothed),
                 RenderCommand::Batch(PrimitiveBatch::Paths {
                     range,
                     rasterization_vertex_count,

@@ -594,8 +594,9 @@ impl<'a> Iterator for BatchIterator<'a> {
                 })
             }
             PrimitiveKind::Quad => {
-                let smoothed =
-                    has_corner_smoothing(self.quads_iter.peek().unwrap().corner_smoothing);
+                let first_quad = self.quads_iter.peek().unwrap();
+                let smoothed = has_corner_smoothing(first_quad.corner_smoothing);
+                let cutout = first_quad.cutout != 0;
                 let quads_start = self.quads_start;
                 let mut quads_end = quads_start + 1;
                 self.quads_iter.next();
@@ -604,6 +605,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                     .next_if(|quad| {
                         precedes_limit(quad.order, batch_kind, max_order_and_kind)
                             && has_corner_smoothing(quad.corner_smoothing) == smoothed
+                            && (quad.cutout != 0) == cutout
                     })
                     .is_some()
                 {
@@ -613,6 +615,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 Some(PrimitiveBatch::Quads {
                     range: quads_start..quads_end,
                     smoothed,
+                    cutout,
                 })
             }
             PrimitiveKind::Path => {
@@ -786,7 +789,9 @@ pub struct Quad {
     pub corner_radii: Corners<ScaledPixels>,
     pub border_widths: Edges<ScaledPixels>,
     pub corner_smoothing: f32,
-    pub padding: u32,
+    /// Nonzero for a cutout: the quad clears what is beneath it, by its
+    /// coverage, instead of painting. See [`crate::Window::paint_cutout`].
+    pub cutout: u32,
 }
 
 impl Default for Quad {
@@ -803,7 +808,7 @@ impl Default for Quad {
             corner_radii: Default::default(),
             border_widths: Default::default(),
             corner_smoothing: Default::default(),
-            padding: Default::default(),
+            cutout: Default::default(),
         }
     }
 }
@@ -1396,7 +1401,9 @@ mod tests {
         let batch_signatures = batches(&mut scene)
             .into_iter()
             .map(|batch| match batch {
-                PrimitiveBatch::Quads { range, smoothed } => ("quad", None, range, smoothed),
+                PrimitiveBatch::Quads {
+                    range, smoothed, ..
+                } => ("quad", None, range, smoothed),
                 PrimitiveBatch::Shadows { range, smoothed } => ("shadow", None, range, smoothed),
                 PrimitiveBatch::PolychromeSprites {
                     texture_id,
@@ -1628,7 +1635,11 @@ mod tests {
 
         assert!(matches!(
             scene.render_commands(),
-            [RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed: false })]
+            [RenderCommand::Batch(PrimitiveBatch::Quads {
+                range,
+                smoothed: false,
+                cutout: false
+            })]
                 if range == &(0..1)
         ));
     }

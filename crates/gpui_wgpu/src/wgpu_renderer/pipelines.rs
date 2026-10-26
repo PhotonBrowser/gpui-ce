@@ -51,6 +51,8 @@ fn instance_binding_entries(source: InstanceBindingSource<'_>) -> Vec<wgpu::Bind
 pub(super) struct WgpuPipelines {
     pub(super) quads: WgpuRenderPipeline,
     pub(super) smoothed_quads: WgpuRenderPipeline,
+    pub(super) cutout_quads: WgpuRenderPipeline,
+    pub(super) smoothed_cutout_quads: WgpuRenderPipeline,
     pub(super) shadows: WgpuRenderPipeline,
     pub(super) smoothed_shadows: WgpuRenderPipeline,
     pub(super) path_rasterization: WgpuRenderPipeline,
@@ -391,6 +393,7 @@ impl WgpuPipelines {
         );
 
         let scene_target = color_target(surface_format, Some(scene_blend_state(alpha_mode)));
+        let cutout_target = color_target(surface_format, Some(cutout_blend_state()));
         let path_rasterization_target = color_target(
             surface_format,
             Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -426,6 +429,13 @@ impl WgpuPipelines {
         Self {
             quads: create(shader::QUADS, &scene_target, 1, &shader_module),
             smoothed_quads: create(shader::SMOOTHED_QUADS, &scene_target, 1, &shader_module),
+            cutout_quads: create(shader::QUADS, &cutout_target, 1, &shader_module),
+            smoothed_cutout_quads: create(
+                shader::SMOOTHED_QUADS,
+                &cutout_target,
+                1,
+                &shader_module,
+            ),
             shadows: create(shader::SHADOWS, &scene_target, 1, &shader_module),
             smoothed_shadows: create(shader::SMOOTHED_SHADOWS, &scene_target, 1, &shader_module),
             path_rasterization: create(
@@ -652,6 +662,19 @@ fn source_over_blend_state(source_color_factor: wgpu::BlendFactor) -> wgpu::Blen
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         },
+    }
+}
+
+/// Removes what is beneath by the fragment's coverage ("destination out").
+fn cutout_blend_state() -> wgpu::BlendState {
+    let component = wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::Zero,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    };
+    wgpu::BlendState {
+        color: component,
+        alpha: component,
     }
 }
 

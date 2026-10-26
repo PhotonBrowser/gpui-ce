@@ -260,6 +260,9 @@ pub struct MetalRenderer {
     presents_with_transaction: bool,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
+    /// Whether the window layer is marked opaque now. A frame with cutouts
+    /// keeps it transparent, or Core Animation would show the holes black.
+    layer_opaque: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
@@ -267,6 +270,8 @@ pub struct MetalRenderer {
     smoothed_shadows_pipeline_state: metal::RenderPipelineState,
     quads_pipeline_state: metal::RenderPipelineState,
     smoothed_quads_pipeline_state: metal::RenderPipelineState,
+    cutout_quads_pipeline_state: metal::RenderPipelineState,
+    smoothed_cutout_quads_pipeline_state: metal::RenderPipelineState,
     underlines_pipeline_state: metal::RenderPipelineState,
     monochrome_sprites_pipeline_state: metal::RenderPipelineState,
     polychrome_sprites_pipeline_state: metal::RenderPipelineState,
@@ -450,6 +455,18 @@ impl MetalRenderer {
             smoothed_quads_shader,
             MTLPixelFormat::BGRA8Unorm,
         );
+        let cutout_quads_pipeline_state = build_cutout_pipeline_state(
+            &device,
+            &quads_library,
+            quads_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
+        let smoothed_cutout_quads_pipeline_state = build_cutout_pipeline_state(
+            &device,
+            &smoothed_quads_library,
+            smoothed_quads_shader,
+            MTLPixelFormat::BGRA8Unorm,
+        );
         let (underlines_shader, underlines_library) = pipeline("underlines");
         let underlines_pipeline_state = build_pipeline_state(
             &device,
@@ -495,6 +512,7 @@ impl MetalRenderer {
             is_apple_gpu,
             is_unified_memory,
             opaque,
+            layer_opaque: opaque,
             command_queue,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
@@ -502,6 +520,8 @@ impl MetalRenderer {
             smoothed_shadows_pipeline_state,
             quads_pipeline_state,
             smoothed_quads_pipeline_state,
+            cutout_quads_pipeline_state,
+            smoothed_cutout_quads_pipeline_state,
             underlines_pipeline_state,
             monochrome_sprites_pipeline_state,
             polychrome_sprites_pipeline_state,
@@ -760,9 +780,14 @@ impl MetalRenderer {
 
     pub fn update_transparency(&mut self, transparent: bool) {
         self.opaque = !transparent;
+        self.set_layer_opaque(!transparent);
+    }
+
+    fn set_layer_opaque(&mut self, opaque: bool) {
         if let Some(layer) = &self.layer {
-            layer.set_opaque(!transparent);
+            layer.set_opaque(opaque);
         }
+        self.layer_opaque = opaque;
     }
 
     pub fn destroy(&mut self) {
@@ -797,6 +822,10 @@ impl MetalRenderer {
         if viewport_size.width.0 <= 0 || viewport_size.height.0 <= 0 {
             self.drawables.invalidate();
             return false;
+        }
+        let layer_opaque = self.opaque && !scene.quads.iter().any(|quad| quad.cutout != 0);
+        if layer_opaque != self.layer_opaque {
+            self.set_layer_opaque(layer_opaque);
         }
         // Acquisition normally finishes off this thread before the frame. When
         // it is late, wait for it a while rather than skip the display cycle;
@@ -1218,9 +1247,14 @@ impl MetalRenderer {
                         &scene_uniforms,
                         command_encoder,
                     ),
-                RenderCommand::Batch(PrimitiveBatch::Quads { range, smoothed }) => self.draw_quads(
+                RenderCommand::Batch(PrimitiveBatch::Quads {
+                    range,
+                    smoothed,
+                    cutout,
+                }) => self.draw_quads(
                     &scene.quads[range.clone()],
                     *smoothed,
+                    *cutout,
                     instance_buffer,
                     &mut instance_offset,
                     &scene_uniforms,
@@ -1852,6 +1886,7 @@ impl MetalRenderer {
         &self,
         quads: &[Quad],
         smoothed: bool,
+        cutout: bool,
         instance_buffer: &mut InstanceBuffer,
         instance_offset: &mut usize,
         scene_uniforms: &SceneUniforms,
@@ -1868,10 +1903,11 @@ impl MetalRenderer {
             return false;
         }
 
-        let pipeline = if smoothed {
-            &self.smoothed_quads_pipeline_state
-        } else {
-            &self.quads_pipeline_state
+        let pipeline = match (smoothed, cutout) {
+            (false, false) => &self.quads_pipeline_state,
+            (true, false) => &self.smoothed_quads_pipeline_state,
+            (false, true) => &self.cutout_quads_pipeline_state,
+            (true, true) => &self.smoothed_cutout_quads_pipeline_state,
         };
         command_encoder.set_render_pipeline_state(pipeline);
         bind_scene_uniforms(command_encoder, scene_uniforms);
@@ -2427,6 +2463,40 @@ fn build_pipeline_state(
         .expect("could not create render pipeline state")
 }
 
+/// Like [`build_pipeline_state`], but the fragment's coverage removes what is
+/// beneath instead of painting over it ("destination out").
+fn build_cutout_pipeline_state(
+    device: &metal::DeviceRef,
+    library: &metal::LibraryRef,
+    shader: &NativeShader,
+    pixel_format: metal::MTLPixelFormat,
+) -> metal::RenderPipelineState {
+    let vertex_fn = library
+        .get_function(shader.vertex_entry, None)
+        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.vertex_entry));
+    let fragment_fn = library
+        .get_function(shader.fragment_entry, None)
+        .unwrap_or_else(|error| panic!("error locating {}: {error}", shader.fragment_entry));
+
+    let descriptor = metal::RenderPipelineDescriptor::new();
+    descriptor.set_label(shader.label);
+    descriptor.set_vertex_function(Some(vertex_fn.as_ref()));
+    descriptor.set_fragment_function(Some(fragment_fn.as_ref()));
+    let color_attachment = descriptor.color_attachments().object_at(0).unwrap();
+    color_attachment.set_pixel_format(pixel_format);
+    color_attachment.set_blending_enabled(true);
+    color_attachment.set_rgb_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_alpha_blend_operation(metal::MTLBlendOperation::Add);
+    color_attachment.set_source_rgb_blend_factor(metal::MTLBlendFactor::Zero);
+    color_attachment.set_source_alpha_blend_factor(metal::MTLBlendFactor::Zero);
+    color_attachment.set_destination_rgb_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+    color_attachment.set_destination_alpha_blend_factor(metal::MTLBlendFactor::OneMinusSourceAlpha);
+
+    device
+        .new_render_pipeline_state(&descriptor)
+        .expect("could not create render pipeline state")
+}
+
 fn build_path_sprite_pipeline_state(
     device: &metal::DeviceRef,
     library: &metal::LibraryRef,
@@ -2886,6 +2956,64 @@ mod tests {
             .unwrap();
         for pixel in image.pixels() {
             assert_eq!(pixel.0, [255, 0, 0, 255]);
+        }
+    }
+
+    #[test]
+    fn cutout_quads_clear_what_is_beneath() {
+        let mut renderer = MetalHeadlessRenderer::new();
+        let bounds = |x, y, size| Bounds {
+            origin: gpui::point(ScaledPixels(x), ScaledPixels(y)),
+            size: Size {
+                width: ScaledPixels(size),
+                height: ScaledPixels(size),
+            },
+        };
+        let mut scene = Scene::default();
+        let full = bounds(0.0, 0.0, 4.0);
+        scene.insert_primitive(Quad {
+            order: 0,
+            bounds: full,
+            content_mask: ContentMask {
+                bounds: full,
+                ..Default::default()
+            },
+            background: solid_background(hsla(0.0, 1.0, 0.5, 1.0)),
+            ..Default::default()
+        });
+        let hole = bounds(1.0, 1.0, 2.0);
+        scene.insert_primitive(Quad {
+            order: 1,
+            bounds: hole,
+            content_mask: ContentMask {
+                bounds: hole,
+                ..Default::default()
+            },
+            background: solid_background(hsla(0.0, 0.0, 0.0, 1.0)),
+            cutout: 1,
+            ..Default::default()
+        });
+        scene.finish();
+        let image = renderer
+            .render_scene_to_image(
+                &scene,
+                Size {
+                    width: DevicePixels(4),
+                    height: DevicePixels(4),
+                },
+            )
+            .unwrap();
+
+        for y in 0..4 {
+            for x in 0..4 {
+                let inside = (1..3).contains(&x) && (1..3).contains(&y);
+                let expected = if inside {
+                    [0, 0, 0, 0]
+                } else {
+                    [255, 0, 0, 255]
+                };
+                assert_pixel_close(&image, x, y, expected, 0, "cutout");
+            }
         }
     }
 

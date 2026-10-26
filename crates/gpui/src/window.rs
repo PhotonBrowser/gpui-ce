@@ -4902,7 +4902,7 @@ impl Window {
             border_dashed_length: quad.border_dashed_length,
             border_dashed_gap: quad.border_dashed_gap,
             corner_smoothing: quad.corner_smoothing.clamp(0.0, 1.0),
-            padding: 0,
+            cutout: 0,
         };
 
         if !quad.background.is_transparent() {
@@ -4955,6 +4955,36 @@ impl Window {
                 });
             }
         }
+    }
+
+    /// Clears a rounded rectangle of the window to transparent, so native
+    /// content beneath the window's layer shows through. Anything painted
+    /// later in the frame draws over the cleared area as usual. Platforms
+    /// whose renderer cannot clear pixels leave the area as it was painted.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_cutout(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        corner_radii: Corners<Pixels>,
+        corner_smoothing: f32,
+    ) {
+        self.invalidator.debug_assert_paint();
+        let quad = Quad {
+            order: 0,
+            bounds: self.snap_bounds(bounds),
+            content_mask: self.snapped_content_mask(),
+            background: crate::black().into(),
+            corner_radii: corner_radii.scale(
+                self.scale_factor()
+                    * (self.paint_scale_factor().width + self.paint_scale_factor().height)
+                    / 2.0,
+            ),
+            corner_smoothing: corner_smoothing.clamp(0.0, 1.0),
+            cutout: 1,
+            ..Default::default()
+        };
+        self.next_frame.scene.insert_primitive(quad);
     }
 
     /// Paint the given `Path` into the scene for the next frame at the current z-index.

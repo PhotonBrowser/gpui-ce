@@ -17,7 +17,7 @@ pub mod quad {
         pub corner_radii: Corners,
         pub border_widths: Edges,
         pub corner_smoothing: f32,
-        pub padding: u32,
+        pub cutout: u32,
     }
     storage!(group(1), binding(0), QUADS: RuntimeArray<Quad>);
 
