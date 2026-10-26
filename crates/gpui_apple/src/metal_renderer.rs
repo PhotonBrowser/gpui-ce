@@ -270,7 +270,7 @@ pub struct MetalRenderer {
     /// The cutouts in the last presented frame, as bounds and clip.
     presented_cutouts: Vec<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
     /// Whether the window layer presents drawables with Core Animation
-    /// transactions now: while the window asks to, or while a cutout moves.
+    /// transactions now: while the window asks to, or while it has cutouts.
     layer_presents_with_transaction: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
@@ -847,10 +847,11 @@ impl MetalRenderer {
             .filter(|quad| quad.cutout != 0)
             .map(|quad| (quad.bounds, quad.content_mask.bounds))
             .collect::<Vec<_>>();
-        // Native content shown through a cutout is placed in this same turn,
-        // in a Core Animation transaction. A drawable presented on its own
-        // reaches the screen a frame or more later, so while a cutout moves,
-        // present with that transaction to keep hole and content together.
+        // Native content shown through a cutout moves in the same main-thread
+        // turn, in a Core Animation transaction. A drawable presented on its
+        // own reaches the screen a frame or more later, so a window with
+        // cutouts presents with that transaction, keeping hole and content
+        // together.
         let cutouts_moved = cutouts != self.presented_cutouts;
         let layer_opaque = self.opaque && cutouts.is_empty();
         if layer_opaque != self.layer_opaque {
@@ -921,7 +922,11 @@ impl MetalRenderer {
         }
 
         self.presented_cutouts = cutouts;
-        let presents_with_transaction = self.presents_with_transaction || cutouts_moved;
+        // The layer must already present with transactions when a drawable is
+        // acquired, so it does for as long as the window has cutouts, not
+        // only for the frames in which they move.
+        let presents_with_transaction =
+            self.presents_with_transaction || !self.presented_cutouts.is_empty();
         if presents_with_transaction != self.layer_presents_with_transaction {
             self.set_layer_presents_with_transaction(presents_with_transaction);
         }
