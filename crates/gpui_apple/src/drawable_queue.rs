@@ -47,7 +47,6 @@ impl<T: Send + 'static> DrawableQueue<T> {
         });
     }
 
-    #[cfg(test)]
     pub(crate) fn take(&mut self) -> Option<T> {
         self.take_within(Duration::ZERO)
     }
@@ -95,7 +94,7 @@ mod tests {
     };
 
     #[gpui::test]
-    fn acquisition_is_deferred_and_coalesces_requests(cx: &mut gpui::TestAppContext) {
+    fn taking_is_nonblocking_and_acquisitions_are_coalesced(cx: &mut gpui::TestAppContext) {
         let acquisitions = Arc::new(AtomicUsize::new(0));
         let mut queue = DrawableQueue::default();
         for _ in 0..20 {

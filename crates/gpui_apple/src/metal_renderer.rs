@@ -57,10 +57,6 @@ const PATH_SAMPLE_COUNT: u32 = 4;
 /// Displayed, submitted, and prepared frames need separate drawables so
 /// acquisition can finish before the next display tick.
 const MAXIMUM_DRAWABLE_COUNT: NSUInteger = 3;
-/// How long a frame waits for a drawable still being acquired: most of a
-/// 60 Hz display cycle, so a briefly busy pool still presents this cycle.
-const DRAWABLE_WAIT: std::time::Duration = std::time::Duration::from_millis(12);
-
 // Buffer slots declared by the generated MSL. Group 0 globals land at 0/1, the group 1 data
 // binding at 2, Naga's runtime-array sizes buffer at 3.
 const GLOBALS_SLOT: u64 = 0;
@@ -669,10 +665,16 @@ impl MetalRenderer {
     /// `CAMetalLayer` joins a drawable to the current Core Animation
     /// transaction only while this is set on the layer itself.
     fn set_layer_presents_with_transaction(&mut self, presents_with_transaction: bool) {
+        if self.layer_presents_with_transaction == presents_with_transaction {
+            return;
+        }
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
         }
         self.layer_presents_with_transaction = presents_with_transaction;
+        // A drawable acquired under the previous transaction mode cannot be
+        // presented reliably in the new one. Drop its result after acquisition.
+        self.drawables.invalidate();
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -866,24 +868,10 @@ impl MetalRenderer {
             drawable.texture().width() == viewport_size.width.0 as u64
                 && drawable.texture().height() == viewport_size.height.0 as u64
         };
-        let drawable = if presents_with_transaction {
-            // A transactional frame cannot wait for a later cycle, and a
-            // drawable it presents is held until the transaction commits.
-            // Acquire on this thread, as upstream GPUI does, and keep none
-            // in reserve, which would leave too few to acquire from.
-            self.drawables.clear();
-            objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
-        } else {
-            // Acquisition normally finishes off this thread before the frame.
-            // When it is late, wait for it a while rather than skip the
-            // display cycle; a skipped cycle halves the frame rate while
-            // drawables are busy.
-            self.drawables.take_within(DRAWABLE_WAIT)
-        };
-        let Some(drawable) = drawable.filter(|drawable| fits(drawable)) else {
-            if !presents_with_transaction {
-                self.request_drawable(executor);
-            }
+        // `next_drawable()` can wait for the pool to free a buffer. Acquire on
+        // the background executor and retry on a later frame if it is not ready.
+        let Some(drawable) = self.drawables.take().filter(|drawable| fits(drawable)) else {
+            self.request_drawable(executor);
             return true;
         };
         let drawable = drawable.as_ref();
@@ -892,9 +880,7 @@ impl MetalRenderer {
         // Start acquiring the next drawable while this scene is encoded. If
         // CAMetalLayer needs to wait for an in-flight drawable, that wait can
         // overlap CPU work instead of delaying the next window frame.
-        if !presents_with_transaction {
-            self.request_drawable(executor);
-        }
+        self.request_drawable(executor);
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_primitives(
