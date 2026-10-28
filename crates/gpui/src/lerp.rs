@@ -148,8 +148,28 @@ impl Lerp for Hsla {
 
         let from: Rgba = (*self).into_color();
         let to: Rgba = (*to).into_color();
-        from.lerp(&to, delta).into_color()
+        premultiplied_lerp(from, to, delta).into_color()
     }
+}
+
+/// Interpolates colours with premultiplied alpha, as CSS does, so a fade
+/// from a transparent colour takes on the other colour's hue instead of
+/// passing through the transparent colour's own, such as the black of
+/// `Hsla::default()`.
+fn premultiplied_lerp(from: Rgba, to: Rgba, delta: f32) -> Rgba {
+    let alpha = lerp(from.alpha, to.alpha, delta);
+    if alpha <= f32::EPSILON {
+        return Rgba::new(to.color.red, to.color.green, to.color.blue, 0.0);
+    }
+    let channel = |from_channel: f32, to_channel: f32| {
+        lerp(from_channel * from.alpha, to_channel * to.alpha, delta) / alpha
+    };
+    Rgba::new(
+        channel(from.color.red, to.color.red),
+        channel(from.color.green, to.color.green),
+        channel(from.color.blue, to.color.blue),
+        alpha,
+    )
 }
 
 impl Lerp for RingColor {
@@ -237,4 +257,21 @@ where
     T: Copy + Add<Output = T> + Sub<Output = T> + Mul<Output = T>,
 {
     from + (to - from) * alpha
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Lerp;
+    use palette::Hsla;
+
+    #[test]
+    fn fading_in_from_transparent_black_keeps_the_target_colour() {
+        let white = Hsla::new(0.0, 0.0, 1.0, 0.2);
+        let halfway = Hsla::new(0.0, 0.0, 0.0, 0.0).lerp(&white, 0.5);
+        assert!((halfway.alpha - 0.1).abs() < 1e-4);
+        assert!(
+            (halfway.color.lightness - 1.0).abs() < 1e-3,
+            "a fade from transparent should not darken: {halfway:?}"
+        );
+    }
 }

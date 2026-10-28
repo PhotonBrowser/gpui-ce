@@ -359,7 +359,10 @@ impl Default for Background {
     fn default() -> Self {
         Self {
             tag: BackgroundTag::Solid,
-            solid: Hsla::default().into(),
+            // No background paints nothing: transparent, not palette's
+            // default of opaque black, which a style transition from or to a
+            // missing background would otherwise flash through.
+            solid: transparent_black().into(),
             color_space: ColorSpace::default(),
             gradient_angle_or_pattern_height: 0.0,
             colors: [LinearColorStop::default(), LinearColorStop::default()],
@@ -573,6 +576,12 @@ impl<T: IntoColor<Hsla>> From<T> for Background {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_default_background_is_transparent() {
+        let solid = super::Background::default().as_solid().unwrap();
+        assert_eq!(solid.alpha, 0.0);
+    }
+
     use super::*;
 
     #[test]
