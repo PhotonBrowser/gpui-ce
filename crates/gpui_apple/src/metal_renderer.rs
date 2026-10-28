@@ -44,7 +44,10 @@ use wgsl_rs::std::{vec2f, vec4f};
 use std::{
     cell::Cell,
     mem, ptr,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 fn external_surface_trace_enabled() -> bool {
@@ -261,6 +264,9 @@ pub struct MetalRenderer {
     layer_opaque: bool,
     /// The cutouts in the last presented frame, as bounds and clip.
     presented_cutouts: Vec<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
+    /// Drawables presented with a Core Animation transaction and not yet on
+    /// screen. Each holds a place in the pool until it is displayed.
+    transactional_drawables_pending: Arc<AtomicUsize>,
     /// Whether the window layer presents drawables with Core Animation
     /// transactions now: while the window asks to, or while it has cutouts.
     layer_presents_with_transaction: bool,
@@ -515,6 +521,7 @@ impl MetalRenderer {
             opaque,
             layer_opaque: opaque,
             presented_cutouts: Vec::new(),
+            transactional_drawables_pending: Arc::new(AtomicUsize::new(0)),
             layer_presents_with_transaction: false,
             command_queue,
             paths_rasterization_pipeline_state,
@@ -868,10 +875,37 @@ impl MetalRenderer {
             drawable.texture().width() == viewport_size.width.0 as u64
                 && drawable.texture().height() == viewport_size.height.0 as u64
         };
-        // `next_drawable()` can wait for the pool to free a buffer. Acquire on
-        // the background executor and retry on a later frame if it is not ready.
-        let Some(drawable) = self.drawables.take().filter(|drawable| fits(drawable)) else {
-            self.request_drawable(executor);
+        // A transactional frame cannot be retried later: native content behind
+        // its cutouts has already moved in this transaction, and skipping the
+        // frame leaves the old cutouts on screen over it, as on every frame of
+        // a resize. It acquires on this thread, as upstream GPUI does, and keeps
+        // none in reserve: a drawable it presents is held until the transaction
+        // commits, so an acquisition in flight leaves too few to acquire from,
+        // and `next_drawable()` then blocks for up to a second.
+        //
+        // Otherwise `next_drawable()`, which can wait for the pool to free a
+        // buffer, runs on the background executor, and the frame is retried
+        // later if it is not ready.
+        //
+        // AppKit can draw a window several times before committing, as when a
+        // live resize starts. Every drawable presented in that transaction
+        // stays held, and with the one on screen they can exhaust the pool;
+        // `next_drawable()` would then block for its full one-second timeout.
+        // Skip the frame instead; the next one acquires once they are shown.
+        let pool_exhausted = self.transactional_drawables_pending.load(Ordering::Acquire) + 1
+            >= MAXIMUM_DRAWABLE_COUNT as usize;
+        let drawable = if presents_with_transaction && pool_exhausted {
+            None
+        } else if presents_with_transaction {
+            self.drawables.clear();
+            objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
+        } else {
+            self.drawables.take()
+        };
+        let Some(drawable) = drawable.filter(|drawable| fits(drawable)) else {
+            if !presents_with_transaction {
+                self.request_drawable(executor);
+            }
             return true;
         };
         let drawable = drawable.as_ref();
@@ -880,7 +914,9 @@ impl MetalRenderer {
         // Start acquiring the next drawable while this scene is encoded. If
         // CAMetalLayer needs to wait for an in-flight drawable, that wait can
         // overlap CPU work instead of delaying the next window frame.
-        self.request_drawable(executor);
+        if !presents_with_transaction {
+            self.request_drawable(executor);
+        }
 
         let mut instance_buffer = self.acquire_instance_buffer(scene);
         let command_buffer = match self.draw_primitives(
@@ -919,6 +955,12 @@ impl MetalRenderer {
 
         self.presented_cutouts = cutouts;
         if presents_with_transaction {
+            let pending = self.transactional_drawables_pending.clone();
+            pending.fetch_add(1, Ordering::AcqRel);
+            let handler = ConcreteBlock::new(move |_: &metal::DrawableRef| {
+                pending.fetch_sub(1, Ordering::AcqRel);
+            });
+            drawable.add_presented_handler(&handler.copy());
             Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
