@@ -264,11 +264,12 @@ pub struct MetalRenderer {
     layer_opaque: bool,
     /// The cutouts in the last presented frame, as bounds and clip.
     presented_cutouts: Vec<(Bounds<ScaledPixels>, Bounds<ScaledPixels>)>,
-    /// Drawables presented with a Core Animation transaction and not yet on
-    /// screen. Each holds a place in the pool until it is displayed.
-    transactional_drawables_pending: Arc<AtomicUsize>,
+    /// Drawables presented and not yet on screen, however they were
+    /// presented. Each holds a place in the pool until it is displayed.
+    drawables_pending: Arc<AtomicUsize>,
     /// Whether the window layer presents drawables with Core Animation
-    /// transactions now: while the window asks to, or while it has cutouts.
+    /// transactions now: while the window asks to, or for a frame whose
+    /// cutouts moved.
     layer_presents_with_transaction: bool,
     command_queue: CommandQueue,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
@@ -521,7 +522,7 @@ impl MetalRenderer {
             opaque,
             layer_opaque: opaque,
             presented_cutouts: Vec::new(),
-            transactional_drawables_pending: Arc::new(AtomicUsize::new(0)),
+            drawables_pending: Arc::new(AtomicUsize::new(0)),
             layer_presents_with_transaction: false,
             command_queue,
             paths_rasterization_pipeline_state,
@@ -661,12 +662,22 @@ impl MetalRenderer {
         &self.sprite_atlas
     }
 
+    /// Whether a frame with cutouts would find no drawable to present with
+    /// its transaction. Such a frame must not be laid out at all: laying it
+    /// out moves the native content behind its cutouts, and a frame that then
+    /// cannot present leaves the old cutouts over the moved content.
+    pub fn transactional_drawables_exhausted(&self) -> bool {
+        self.layer_presents_with_transaction
+            && self.drawables_pending.load(Ordering::Acquire) + 1 >= MAXIMUM_DRAWABLE_COUNT as usize
+    }
+
     pub fn set_presents_with_transaction(&mut self, presents_with_transaction: bool) {
         self.presents_with_transaction = presents_with_transaction;
-        // A window with cutouts keeps presenting with transactions; see `draw`.
-        self.set_layer_presents_with_transaction(
-            presents_with_transaction || !self.presented_cutouts.is_empty(),
-        );
+        // Otherwise each frame chooses for itself, by whether its cutouts
+        // moved; see `draw`.
+        if presents_with_transaction {
+            self.set_layer_presents_with_transaction(true);
+        }
     }
 
     /// `CAMetalLayer` joins a drawable to the current Core Animation
@@ -862,10 +873,17 @@ impl MetalRenderer {
         // Native content shown through a cutout moves in the same main-thread
         // turn, in a Core Animation transaction, and a live resize lays the
         // window out in one. A drawable presented on its own reaches the
-        // screen a frame or more later, so such windows present with that
-        // transaction. The layer must already be in that mode when a
-        // drawable is acquired.
-        let presents_with_transaction = self.presents_with_transaction || !cutouts.is_empty();
+        // screen a frame or more later, so a frame whose cutouts moved
+        // presents with that transaction. The layer must already be in that
+        // mode when a drawable is acquired.
+        //
+        // A frame whose cutouts are where they were, as while a page scrolls
+        // or the UI over it animates, has nothing native to keep in step
+        // with. It presents on its own, as an ordinary frame: a transactional
+        // drawable stays held until it is on screen, which with a three
+        // drawable pool caps the frame rate below the display's.
+        let presents_with_transaction =
+            self.presents_with_transaction || cutouts != self.presented_cutouts;
         if presents_with_transaction != self.layer_presents_with_transaction {
             self.set_layer_presents_with_transaction(presents_with_transaction);
         }
@@ -892,8 +910,8 @@ impl MetalRenderer {
         // stays held, and with the one on screen they can exhaust the pool;
         // `next_drawable()` would then block for its full one-second timeout.
         // Skip the frame instead; the next one acquires once they are shown.
-        let pool_exhausted = self.transactional_drawables_pending.load(Ordering::Acquire) + 1
-            >= MAXIMUM_DRAWABLE_COUNT as usize;
+        let pool_exhausted =
+            self.drawables_pending.load(Ordering::Acquire) + 1 >= MAXIMUM_DRAWABLE_COUNT as usize;
         let drawable = if presents_with_transaction && pool_exhausted {
             None
         } else if presents_with_transaction {
@@ -954,13 +972,16 @@ impl MetalRenderer {
         }
 
         self.presented_cutouts = cutouts;
+        // Every presented drawable holds its place in the pool until it is on
+        // screen, however it was presented: a transactional frame acquires on
+        // this thread, and must know whether one is free without waiting.
+        let pending = self.drawables_pending.clone();
+        pending.fetch_add(1, Ordering::AcqRel);
+        let handler = ConcreteBlock::new(move |_: &metal::DrawableRef| {
+            pending.fetch_sub(1, Ordering::AcqRel);
+        });
+        drawable.add_presented_handler(&handler.copy());
         if presents_with_transaction {
-            let pending = self.transactional_drawables_pending.clone();
-            pending.fetch_add(1, Ordering::AcqRel);
-            let handler = ConcreteBlock::new(move |_: &metal::DrawableRef| {
-                pending.fetch_sub(1, Ordering::AcqRel);
-            });
-            drawable.add_presented_handler(&handler.copy());
             Self::notify_external_surfaces_submitted(scene, Some(drawable_id));
             command_buffer.commit();
             command_buffer.wait_until_scheduled();

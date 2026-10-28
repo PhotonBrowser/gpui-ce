@@ -4216,6 +4216,14 @@ extern "C" fn step(view: *mut c_void) {
         let window_state = get_window_state(&*view);
         let mut lock = window_state.lock();
 
+        // While every drawable is on its way to the screen, leave this tick
+        // and draw on a later one, rather than move native content for a frame
+        // that cannot present or wait on the main thread for a drawable.
+        #[cfg(not(feature = "wgpu"))]
+        if lock.renderer.transactional_drawables_exhausted() {
+            return;
+        }
+
         if let Some(mut callback) = lock.request_frame_callback.take() {
             let request = lock.next_frame_request();
             drop(lock);
