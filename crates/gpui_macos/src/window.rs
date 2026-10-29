@@ -69,6 +69,8 @@ use std::{
     time::Duration,
 };
 
+mod popover;
+
 const WINDOW_STATE_IVAR: &str = "windowState";
 const TRAFFIC_LIGHT_HOVER_PADDING: f64 = 8.0;
 // Calibrated to the muted discs AppKit shows for an inactive window.
@@ -1037,6 +1039,8 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<ObjcId>,
+    /// The popover an anchored popup is shown in, in place of its own window.
+    popover: Option<popover::PopoverHost>,
 }
 
 impl MacWindowState {
@@ -1603,16 +1607,19 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
+        // A popover's view is shown in the popover's window, never its own,
+        // which draws from the moment the popover opens, as it animates in.
+        let host_window = popover::host_window(self);
         unsafe {
-            if !self
-                .native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::Visible)
+            if self.popover.is_none()
+                && !host_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::Visible)
             {
                 return;
             }
         }
-        let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
+        let Some(display_id) = display_id_for_screen(unsafe { host_window.screen() }) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
             return;
         };
@@ -1711,7 +1718,7 @@ impl MacWindowState {
     }
 
     fn scale_factor(&self) -> f32 {
-        get_scale_factor(self.native_window)
+        get_scale_factor(popover::host_window(self))
     }
 
     fn window_bounds(&self) -> WindowBounds {
@@ -1753,6 +1760,10 @@ impl MacWindow {
         renderer: renderer::Renderer,
         marker: MainThreadMarker,
     ) -> Self {
+        let popup = match &kind {
+            WindowKind::AnchoredPopup(options) => Some(options.clone()),
+            _ => None,
+        };
         unsafe {
             let pool: ObjcId = msg_send![class!(NSAutoreleasePool), new];
 
@@ -1788,8 +1799,7 @@ impl MacWindow {
                 WindowKind::Normal => {
                     msg_send![&*WINDOW_CLASS, alloc]
                 }
-                // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
-                // for exhaustiveness.
+                // An anchored popup's own window is never shown; see `popover`.
                 WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
                     style_mask |= NSWindowStyleMask::NonactivatingPanel;
                     msg_send![&*PANEL_CLASS, alloc]
@@ -1924,6 +1934,7 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                popover: None,
             }));
             let mut window = Self(state, marker);
 
@@ -1991,8 +2002,6 @@ impl MacWindow {
                         let _: () = msg_send![native_window, setTabbingIdentifier:NIL];
                     }
                 }
-                // `AnchoredPopup` is rejected in `MacPlatform::open_window`, grouped here only
-                // for exhaustiveness.
                 WindowKind::PopUp | WindowKind::AnchoredPopup(_) => {
                     // Use a tracking area to allow receiving MouseMoved events even when
                     // the window or application aren't active, which is often the case
@@ -2058,7 +2067,13 @@ impl MacWindow {
                 }
             }
 
-            if focus && show {
+            if let Some(popup) = popup.as_ref() {
+                // Shown in a popover instead; its own window stays hidden.
+                let host = popover::PopoverHost::show(&window.0, popup, bounds.size);
+                let mut lock = window.0.lock();
+                lock.popover = host;
+                lock.start_display_link();
+            } else if focus && show {
                 native_window.makeKeyAndOrderFront_(NIL);
             } else if show {
                 native_window.orderFront_(NIL);
@@ -2146,6 +2161,9 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        if let Some(popover) = this.popover.take() {
+            unsafe { popover.close() };
+        }
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -2504,7 +2522,8 @@ impl PlatformWindow for MacWindow {
     }
 
     fn is_active(&self) -> bool {
-        unsafe { self.0.lock().native_window.isKeyWindow() == Bool::new(true) }
+        let lock = self.0.lock();
+        unsafe { popover::host_window(&lock).isKeyWindow() == Bool::new(true) }
     }
 
     // is_hovered is unused on macOS. See Window::is_window_hovered.
@@ -3687,7 +3706,10 @@ unsafe extern "C" fn handle_view_event(this: &Objc2Object, _: Sel, native_event:
     let window_state = unsafe { get_window_state(this) };
     let weak_window_state = Arc::downgrade(&window_state);
     let mut lock = window_state.as_ref().lock();
-    let window_height = lock.content_size().height;
+    // Pointer positions are measured from the window's corner; a view inset
+    // in its window, as in a popover, measures from its own.
+    let view_origin = popover::view_origin_in_window(&lock);
+    let window_height = lock.content_size().height + px(view_origin.y as f32);
     let native_event_type = unsafe { native_event.eventType() };
     if matches!(
         native_event_type,
@@ -3716,7 +3738,12 @@ unsafe extern "C" fn handle_view_event(this: &Objc2Object, _: Sel, native_event:
         }
         _ => {}
     }
-    let event = unsafe { platform_input_from_native(native_event.cast(), Some(window_height)) };
+    let mut event = unsafe { platform_input_from_native(native_event.cast(), Some(window_height)) };
+    if view_origin.x != 0.0
+        && let Some(event) = event.as_mut()
+    {
+        shift_input_x(event, px(-view_origin.x as f32));
+    }
 
     if let Some(mut event) = event {
         // AppKit unhides the cursor on the next mouse movement; mirror that here.
@@ -4023,7 +4050,8 @@ unsafe extern "C" fn window_did_change_screen(this: &Objc2Object, _: Sel, _: Obj
 unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: Sel, _: ObjcId) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
-    let is_active = unsafe { lock.native_window.isKeyWindow() == Bool::new(true) };
+    let host_window = popover::host_window(&lock);
+    let is_active = unsafe { host_window.isKeyWindow() == Bool::new(true) };
 
     // AppKit also unhides the cursor on activation changes, so mirror that here.
     lock.cursor_visible.store(true, Ordering::Relaxed);
@@ -4038,10 +4066,9 @@ unsafe extern "C" fn window_did_change_key_status(this: &Objc2Object, selector: 
     // in theory, we're not supposed to invoke this method manually but it balances out
     // the spurious `becomeKeyWindow` event and helps us work around that bug.
     if selector == sel!(windowDidBecomeKey:) && !is_active {
-        let native_window = lock.native_window;
         drop(lock);
         unsafe {
-            let _: () = msg_send![native_window, resignKeyWindow];
+            let _: () = msg_send![host_window, resignKeyWindow];
         }
         return;
     }
@@ -4905,4 +4932,19 @@ mod tests {
             ))
         );
     }
+}
+
+/// Moves a pointer event's position `dx` across.
+fn shift_input_x(input: &mut PlatformInput, dx: Pixels) {
+    let position = match input {
+        PlatformInput::MouseDown(event) => &mut event.position,
+        PlatformInput::MouseUp(event) => &mut event.position,
+        PlatformInput::MouseMove(event) => &mut event.position,
+        PlatformInput::MouseExited(event) => &mut event.position,
+        PlatformInput::ScrollWheel(event) => &mut event.position,
+        PlatformInput::MousePressure(event) => &mut event.position,
+        PlatformInput::Pinch(event) => &mut event.position,
+        _ => return,
+    };
+    position.x += dx;
 }
