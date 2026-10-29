@@ -68,6 +68,11 @@ pub struct PopupOptions {
     /// your own application still reaches it as usual, so closing the popup in that case is up
     /// to you. Nested grabbing popups must be closed in the reverse order they were opened.
     pub grab: bool,
+
+    /// Whether the popup draws an arrow pointing at its anchor, where the
+    /// platform draws one, as macOS popovers do. Without one the popup's
+    /// content covers all of it.
+    pub arrow: bool,
 }
 
 impl PopupOptions {
@@ -83,6 +88,7 @@ impl PopupOptions {
             constraint_adjustment: PopupConstraintAdjustment::default(),
             offset: Point::default(),
             grab: false,
+            arrow: true,
         }
     }
 }

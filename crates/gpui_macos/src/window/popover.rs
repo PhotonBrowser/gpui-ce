@@ -92,6 +92,9 @@ impl PopoverHost {
             let _: () = msg_send![popover, setContentViewController: controller];
             let _: () = msg_send![controller, release];
             let _: () = msg_send![popover, setDelegate: delegate];
+            if !options.arrow {
+                hide_arrow(popover);
+            }
 
             let anchor = anchor_rect(parent_view, options);
             let edge = preferred_edge(options.gravity);
@@ -203,6 +206,17 @@ fn preferred_edge(gravity: PopupGravity) -> NSUInteger {
         PopupGravity::Right | PopupGravity::TopRight | PopupGravity::BottomRight => MAX_X,
         PopupGravity::Top => MAX_Y,
         PopupGravity::Bottom | PopupGravity::Center => MIN_Y,
+    }
+}
+
+/// Hides the popover's arrow, through AppKit's private `shouldHideAnchor`,
+/// which AppKit has long honored; a release without it keeps the arrow.
+unsafe fn hide_arrow(popover: ObjcId) {
+    unsafe {
+        let responds: Bool = msg_send![popover, respondsToSelector: sel!(setShouldHideAnchor:)];
+        if responds.as_bool() {
+            let _: () = msg_send![popover, setShouldHideAnchor: Bool::new(true)];
+        }
     }
 }
 
