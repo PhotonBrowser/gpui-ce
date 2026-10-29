@@ -116,7 +116,7 @@ impl PopoverHost {
     /// Closes the popover without reporting back, as the window goes.
     pub(super) unsafe fn close(self) {
         unsafe {
-            stop_observing_key_status(self.delegate, self.popover);
+            stop_observing_key_status(self.delegate);
             let _: () = msg_send![self.popover, setDelegate: NIL];
             let _: () = msg_send![self.popover, close];
             let _: () = msg_send![self.popover, release];
@@ -220,11 +220,10 @@ unsafe fn hide_arrow(popover: ObjcId) {
     }
 }
 
-unsafe fn stop_observing_key_status(delegate: ObjcId, popover: ObjcId) {
+unsafe fn stop_observing_key_status(delegate: ObjcId) {
     unsafe {
         let center: ObjcId = msg_send![class!(NSNotificationCenter), defaultCenter];
         let _: () = msg_send![center, removeObserver: delegate];
-        let _ = popover;
     }
 }
 
