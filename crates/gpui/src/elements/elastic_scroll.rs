@@ -7,14 +7,12 @@ use std::{collections::VecDeque, time::Instant};
 
 use crate::{Pixels, Point};
 
-/// Scales the rendered stretch; lower values make edge overscroll gentler.
-const ELASTIC_SCROLL_INTENSITY: f32 = 0.8;
 const RUBBER_BAND_STIFFNESS: f32 = 12.0;
 const RUBBER_BAND_AMPLITUDE: f32 = 0.31;
 const RUBBER_BAND_PERIOD: f64 = 1.2;
 const REBOUND_DECAY_PER_SECOND: f64 = RUBBER_BAND_STIFFNESS as f64 / RUBBER_BAND_PERIOD;
 const LARGEST_BOUNCE_AS_SHARE_OF_SCROLLPORT: f32 = 0.2;
-const STRETCH_THAT_COUNTS_AS_SPRUNG_BACK: f32 = 0.25;
+const STRETCH_THAT_COUNTS_AS_SPRUNG_BACK: f32 = 0.5;
 const VELOCITY_SAMPLING_WINDOW_SECONDS: f64 = 0.1;
 const MAXIMUM_PAUSE_BEFORE_LIFT_SECONDS: f64 = 0.1;
 const MAX_TRACKED_STEPS: usize = 20;
@@ -37,13 +35,6 @@ impl Vector {
         Point::new(Pixels::from(self.x), Pixels::from(self.y))
     }
 
-    fn scaled(self, scale: f32) -> Self {
-        Self {
-            x: self.x * scale,
-            y: self.y * scale,
-        }
-    }
-
     fn is_zero(self) -> bool {
         self.x == 0.0 && self.y == 0.0
     }
@@ -64,12 +55,17 @@ struct Rebound {
 }
 
 /// The current stretch and analytic rebound for a scrollable element.
+///
+/// Mirrors Photon Engine's `ElasticOverscroll`: the stretch is held in
+/// presented pixels, so fingers relax it one-for-one, and momentum bounces a
+/// scroller at most once per gesture.
 #[derive(Debug, Default)]
 pub(crate) struct ElasticScroll {
     scrollport_size: Vector,
-    accumulated_overscroll: Vector,
+    held_stretch: Vector,
     rebound: Option<Rebound>,
     velocity_steps: VecDeque<ScrollStep>,
+    momentum_has_bounced: bool,
 }
 
 impl ElasticScroll {
@@ -79,19 +75,20 @@ impl ElasticScroll {
 
     pub(crate) fn stretch(&self) -> Point<Pixels> {
         self.rebound
-            .map_or_else(
-                || {
-                    self.accumulated_overscroll
-                        .scaled(1.0 / RUBBER_BAND_STIFFNESS)
-                },
-                |rebound| rebound.current_stretch,
-            )
-            .scaled(ELASTIC_SCROLL_INTENSITY)
+            .map_or(self.held_stretch, |rebound| rebound.current_stretch)
             .to_point()
     }
 
     pub(crate) fn is_at_rest(&self) -> bool {
-        self.rebound.is_none() && self.accumulated_overscroll.is_zero()
+        self.rebound.is_none() && self.held_stretch.is_zero()
+    }
+
+    /// Fingers touched down: let go of anything a previous gesture still holds.
+    pub(crate) fn begin_gesture(&mut self, now: Instant) -> bool {
+        let released = self.lift(now);
+        self.velocity_steps.clear();
+        self.momentum_has_bounced = false;
+        released
     }
 
     pub(crate) fn add_step(&mut self, delta: Point<Pixels>, time: Instant) {
@@ -104,46 +101,59 @@ impl ElasticScroll {
         });
     }
 
-    /// Returns the part of a finger delta left for ordinary scrolling after it
-    /// first relaxes any existing stretch.
+    /// Uses the part of a finger delta that points back into the scroll range
+    /// to relax the stretch, and returns the rest to scroll with. Fingers take
+    /// a rebound over from wherever it has got to.
     pub(crate) fn relax_by(&mut self, delta: Point<Pixels>) -> Point<Pixels> {
+        self.momentum_has_bounced = false;
         if let Some(rebound) = self.rebound.take() {
-            self.accumulated_overscroll = rebound.current_stretch.scaled(RUBBER_BAND_STIFFNESS);
+            self.held_stretch = rebound.current_stretch;
         }
         let delta = Vector::from_point(delta);
-        let remaining = Vector {
-            x: relax_axis(self.accumulated_overscroll.x, delta.x),
-            y: relax_axis(self.accumulated_overscroll.y, delta.y),
-        };
-        self.accumulated_overscroll.x = relax_axis_value(self.accumulated_overscroll.x, delta.x);
-        self.accumulated_overscroll.y = relax_axis_value(self.accumulated_overscroll.y, delta.y);
-        remaining.to_point()
+        Vector {
+            x: relax_axis_by(&mut self.held_stretch.x, delta.x),
+            y: relax_axis_by(&mut self.held_stretch.y, delta.y),
+        }
+        .to_point()
     }
 
-    /// Add the unconsumed part of a precise scroll gesture at an edge.
-    pub(crate) fn pull_by(&mut self, delta: Point<Pixels>) {
-        debug_assert!(self.rebound.is_none());
-        let delta = Vector::from_point(delta);
-        let max_x = self.scrollport_size.x * RUBBER_BAND_STIFFNESS;
-        let max_y = self.scrollport_size.y * RUBBER_BAND_STIFFNESS;
-        self.accumulated_overscroll.x =
-            (self.accumulated_overscroll.x + delta.x).clamp(-max_x, max_x);
-        self.accumulated_overscroll.y =
-            (self.accumulated_overscroll.y + delta.y).clamp(-max_y, max_y);
-    }
-
-    pub(crate) fn release(&mut self, velocity: Option<Point<Pixels>>, now: Instant) -> bool {
+    /// Fingers pulled further past an edge the scroller is already at.
+    pub(crate) fn pull_by(&mut self, overscroll: Point<Pixels>) {
         if self.rebound.is_some() {
+            return;
+        }
+        let overscroll = Vector::from_point(overscroll);
+        let size = self.scrollport_size;
+        self.held_stretch.x =
+            (self.held_stretch.x + overscroll.x / RUBBER_BAND_STIFFNESS).clamp(-size.x, size.x);
+        self.held_stretch.y =
+            (self.held_stretch.y + overscroll.y / RUBBER_BAND_STIFFNESS).clamp(-size.y, size.y);
+    }
+
+    /// Momentum carried the scroller into its edge: bounce it with the
+    /// arriving velocity, once per gesture.
+    pub(crate) fn bounce_by(&mut self, overscroll: Point<Pixels>, now: Instant) -> bool {
+        if self.momentum_has_bounced || !self.is_at_rest() {
             return false;
         }
-        let initial_stretch = self
-            .accumulated_overscroll
-            .scaled(1.0 / RUBBER_BAND_STIFFNESS);
-        if initial_stretch.is_zero() {
-            self.velocity_steps.clear();
+        self.momentum_has_bounced = true;
+        self.pull_by(overscroll);
+        self.lift(now)
+    }
+
+    /// Fingers lifted: release with the velocity of the recent steps.
+    pub(crate) fn lift(&mut self, now: Instant) -> bool {
+        self.release(self.velocity_at_lift(now), now)
+    }
+
+    /// Releases the held stretch. Momentum that follows a held stretch springs it back
+    /// rather than bouncing again.
+    pub(crate) fn release(&mut self, velocity: Option<Point<Pixels>>, now: Instant) -> bool {
+        if self.rebound.is_some() || self.held_stretch.is_zero() {
             return false;
         }
-        self.accumulated_overscroll = Vector::default();
+        self.momentum_has_bounced = true;
+        let initial_stretch = std::mem::take(&mut self.held_stretch);
         let velocity = velocity.map_or(Vector::default(), Vector::from_point);
         self.rebound = Some(Rebound {
             started_at: now,
@@ -154,21 +164,7 @@ impl ElasticScroll {
             },
             current_stretch: initial_stretch,
         });
-        self.velocity_steps.clear();
         true
-    }
-
-    /// Release a stretch when momentum begins, keeping velocity samples if the
-    /// scroll has not reached an edge yet.
-    pub(crate) fn release_if_stretched(
-        &mut self,
-        velocity: Option<Point<Pixels>>,
-        now: Instant,
-    ) -> bool {
-        if self.rebound.is_some() || self.accumulated_overscroll.is_zero() {
-            return false;
-        }
-        self.release(velocity, now)
     }
 
     /// Advances the rebound to an absolute frame time. Absolute sampling keeps
@@ -275,32 +271,25 @@ impl ElasticScroll {
     }
 
     pub(crate) fn clear(&mut self) {
-        self.accumulated_overscroll = Vector::default();
-        self.rebound = None;
-        self.velocity_steps.clear();
+        *self = Self {
+            scrollport_size: self.scrollport_size,
+            ..Self::default()
+        };
     }
 }
 
-fn relax_axis(accumulated: f32, delta: f32) -> f32 {
-    if !((accumulated > 0.0 && delta < 0.0) || (accumulated < 0.0 && delta > 0.0)) {
+fn relax_axis_by(stretch: &mut f32, delta: f32) -> f32 {
+    let points_back = (*stretch > 0.0 && delta < 0.0) || (*stretch < 0.0 && delta > 0.0);
+    if !points_back {
         return delta;
     }
-    if delta.abs() <= accumulated.abs() {
-        0.0
-    } else {
-        delta + accumulated
+    if delta.abs() <= stretch.abs() {
+        *stretch += delta;
+        return 0.0;
     }
-}
-
-fn relax_axis_value(accumulated: f32, delta: f32) -> f32 {
-    if !((accumulated > 0.0 && delta < 0.0) || (accumulated < 0.0 && delta > 0.0)) {
-        return accumulated;
-    }
-    if delta.abs() <= accumulated.abs() {
-        accumulated + delta
-    } else {
-        0.0
-    }
+    let left = delta + *stretch;
+    *stretch = 0.0;
+    left
 }
 
 fn fastest_release_speed_for(scrollport_length: f32) -> f32 {
@@ -372,14 +361,44 @@ mod tests {
     }
 
     #[test]
-    fn stretch_uses_engine_curve_at_configured_intensity() {
+    fn stretch_uses_engine_curve() {
         let mut scroll = ElasticScroll::default();
         scroll.set_scrollport_size(viewport());
-        scroll.pull_by(Point::new(px(0.0), px(-19.0)));
-        let expected_scale = ELASTIC_SCROLL_INTENSITY / RUBBER_BAND_STIFFNESS;
-        assert!((f32::from(scroll.stretch().y) + 19.0 * expected_scale).abs() < 0.001);
-        scroll.pull_by(Point::new(px(0.0), px(-381.0)));
-        assert!((f32::from(scroll.stretch().y) + 400.0 * expected_scale).abs() < 0.001);
+        scroll.pull_by(Point::new(px(0.0), px(-120.0)));
+        assert!((f32::from(scroll.stretch().y) + 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn fingers_relax_the_stretch_one_for_one() {
+        let mut scroll = ElasticScroll::default();
+        scroll.set_scrollport_size(viewport());
+        scroll.pull_by(Point::new(px(0.0), px(-240.0)));
+        assert_eq!(
+            scroll.relax_by(Point::new(px(0.0), px(15.0))),
+            Point::new(px(0.0), px(0.0))
+        );
+        assert!((f32::from(scroll.stretch().y) + 5.0).abs() < 0.001);
+        assert_eq!(
+            scroll.relax_by(Point::new(px(0.0), px(8.0))),
+            Point::new(px(0.0), px(3.0))
+        );
+        assert!(scroll.is_at_rest());
+    }
+
+    #[test]
+    fn momentum_bounces_once_per_gesture() {
+        let mut scroll = ElasticScroll::default();
+        scroll.set_scrollport_size(viewport());
+        let start = Instant::now();
+        for milliseconds in [0, 10, 20] {
+            scroll.add_step(Point::new(px(0.0), px(-10.0)), after(start, milliseconds));
+        }
+        assert!(scroll.bounce_by(Point::new(px(0.0), px(-24.0)), after(start, 20)));
+        while scroll.advance_rebound_to(after(start, 2000)) {}
+        assert!(scroll.is_at_rest());
+        assert!(!scroll.bounce_by(Point::new(px(0.0), px(-24.0)), after(start, 2010)));
+        scroll.begin_gesture(after(start, 3000));
+        assert!(!scroll.bounce_by(Point::new(px(0.0), px(0.0)), after(start, 3000)));
     }
 
     #[test]
@@ -459,24 +478,6 @@ mod tests {
     }
 
     #[test]
-    fn momentum_without_stretch_keeps_velocity_for_an_edge_bounce() {
-        let mut scroll = ElasticScroll::default();
-        scroll.set_scrollport_size(viewport());
-        let start = Instant::now();
-        for milliseconds in [0, 10, 20] {
-            scroll.add_step(Point::new(px(0.0), px(-10.0)), after(start, milliseconds));
-        }
-
-        assert!(!scroll.release_if_stretched(None, after(start, 20)));
-        let velocity = scroll.velocity_at_lift(after(start, 30)).unwrap();
-        scroll.pull_by(Point::new(px(0.0), px(-24.0)));
-        assert!(scroll.release(Some(velocity), after(start, 30)));
-
-        let rebound = scroll.rebound.unwrap();
-        assert!((rebound.initial_velocity.y + 1_000.0).abs() < 0.1);
-    }
-
-    #[test]
     fn release_velocity_is_limited_to_a_configured_share_of_the_viewport() {
         let mut scroll = ElasticScroll::default();
         scroll.set_scrollport_size(viewport());
@@ -491,9 +492,6 @@ mod tests {
             furthest = furthest.max(f32::from(scroll.stretch().y));
         }
         assert!(furthest > 60.0);
-        assert!(
-            furthest
-                <= 600.0 * LARGEST_BOUNCE_AS_SHARE_OF_SCROLLPORT * ELASTIC_SCROLL_INTENSITY + 1.0
-        );
+        assert!(furthest <= 600.0 * LARGEST_BOUNCE_AS_SHARE_OF_SCROLLPORT + 1.0);
     }
 }

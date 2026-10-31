@@ -4217,7 +4217,10 @@ impl Interactivity {
                         && has_elastic_scroll_axis
                         && event.delta.precise()
                         && (event.has_native_phase || event.is_momentum);
-                    let mut elastic_velocity = None;
+                    let gesture_ended = matches!(
+                        event.touch_phase,
+                        crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
+                    );
                     let mut start_rebound = false;
                     let mut previous_stretch = Point::default();
                     if let Some(elastic_state) = elastic_state.as_ref() {
@@ -4229,20 +4232,14 @@ impl Interactivity {
                         {
                             state.clear();
                         } else if can_elastic_scroll {
-                            let gesture_ended = matches!(
-                                event.touch_phase,
-                                crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
-                            );
-                            if event.is_momentum
-                                || (!gesture_ended
-                                    && event.touch_phase != crate::TouchPhase::Started)
-                            {
-                                state.add_step(gesture_delta, now);
-                            }
-                            elastic_velocity = state.velocity_at_lift(now);
                             if event.is_momentum {
-                                start_rebound |= state.release_if_stretched(elastic_velocity, now);
+                                state.add_step(gesture_delta, now);
+                                // The first momentum step can be the first sign the fingers lifted.
+                                start_rebound |= state.lift(now);
+                            } else if event.touch_phase == crate::TouchPhase::Started {
+                                start_rebound |= state.begin_gesture(now);
                             } else if !gesture_ended {
+                                state.add_step(gesture_delta, now);
                                 delta = state.relax_by(delta);
                             }
                         }
@@ -4300,20 +4297,14 @@ impl Interactivity {
                             // An elastic container consumes the edge delta so a parent does not
                             // scroll in the opposite direction at the same time.
                             cx.stop_propagation();
-                            if !event.is_momentum || state.is_at_rest() {
+                            if event.is_momentum {
+                                start_rebound |= state.bounce_by(overscroll, now);
+                            } else if !gesture_ended {
                                 state.pull_by(overscroll);
-                                if event.is_momentum {
-                                    start_rebound |= state.release(elastic_velocity, now);
-                                }
                             }
                         }
-                        let gesture_ended = matches!(
-                            event.touch_phase,
-                            crate::TouchPhase::Ended | crate::TouchPhase::Cancelled
-                        );
                         if (gesture_ended && !event.is_momentum) || event.is_momentum_ended {
-                            let velocity = state.velocity_at_lift(now).or(elastic_velocity);
-                            start_rebound |= state.release(velocity, now);
+                            start_rebound |= state.lift(now);
                         }
                         elastic_changed = state.stretch() != previous_stretch;
                     }
