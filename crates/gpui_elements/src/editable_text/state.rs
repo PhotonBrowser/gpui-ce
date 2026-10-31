@@ -188,6 +188,12 @@ impl EditableTextState {
         cx.notify();
     }
 
+    /// Returns the current selection, or the caret as an empty range, as a canonical
+    /// logical-order UTF-8 byte range.
+    pub fn selected_range(&self) -> Range<usize> {
+        self.selected_byte_range()
+    }
+
     /// Returns the current selection as a canonical logical-order UTF-8 byte range.
     pub(super) fn selected_byte_range(&self) -> Range<usize> {
         self.selection_movement.result.byte_range()
