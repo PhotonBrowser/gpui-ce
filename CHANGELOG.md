@@ -52,6 +52,8 @@ Items are sorted by issue or pull request number.
 
 Changelog established.
 
+- Added `App::clipboard_handle()` for main-thread clipboard access from native callbacks.
+- Linux clipboard adapters now read and publish image and file URI list formats.
 - Declarative style transitions API. [#125](https://github.com/gpui-ce/gpui-ce/pull/125) [#231](https://github.com/gpui-ce/gpui-ce/pull/231)
   - `InteractiveElement::transitions(..)`
   - struct `Animated<T, Time>`, `Progress`, `Easing`, `MotionSample`, `Motion`
