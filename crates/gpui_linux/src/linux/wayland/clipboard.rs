@@ -2,11 +2,11 @@ use std::{
     fs::File,
     io::{ErrorKind, Write},
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
+    path::PathBuf,
 };
 
 use calloop::{LoopHandle, PostAction};
 use filedescriptor::Pipe;
-use strum::IntoEnumIterator;
 use wayland_client::{Connection, protocol::wl_data_offer::WlDataOffer};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
 
@@ -14,15 +14,38 @@ use crate::linux::{
     WaylandClientStatePtr,
     platform::{PIPE_READ_TIMEOUT, read_fd_with_timeout},
 };
-use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Image, ImageFormat, hash};
+use smallvec::SmallVec;
+use url::Url;
 
 /// Text mime types that we'll offer to other programs.
-pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
-    ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+pub(crate) const TEXT_MIME_TYPES: [&str; 4] = [
+    "text/plain;charset=utf-8",
+    "text/plain;charset=UTF-8",
+    "UTF8_STRING",
+    "text/plain",
+];
 pub(crate) const FILE_LIST_MIME_TYPE: &str = "text/uri-list";
 
+fn file_uri_list(paths: &ExternalPaths) -> String {
+    paths
+        .0
+        .iter()
+        .filter_map(|path| Url::from_file_path(path).ok())
+        .fold(String::new(), |mut list, url| {
+            list.push_str(url.as_str());
+            list.push_str("\r\n");
+            list
+        })
+}
+
 /// Text mime types that we'll accept from other programs.
-pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 2] = ["text/plain;charset=utf-8", "UTF8_STRING"];
+pub(crate) const ALLOWED_TEXT_MIME_TYPES: [&str; 4] = [
+    "text/plain;charset=utf-8",
+    "text/plain;charset=UTF-8",
+    "UTF8_STRING",
+    "text/plain",
+];
 
 pub(crate) struct Clipboard {
     connection: Connection,
@@ -121,11 +144,10 @@ impl<T: ReceiveData> DataOffer<T> {
     }
 
     fn read_image(&self, connection: &Connection) -> Option<ClipboardItem> {
-        for format in ImageFormat::iter() {
-            let mime_type = format.mime_type();
-            if !self.has_mime_type(mime_type) {
+        for mime_type in &self.mime_types {
+            let Some(format) = ImageFormat::from_mime_type(mime_type) else {
                 continue;
-            }
+            };
 
             if let Some(bytes) = self.read_bytes(connection, mime_type) {
                 let id = hash(&bytes);
@@ -135,6 +157,25 @@ impl<T: ReceiveData> DataOffer<T> {
             }
         }
         None
+    }
+
+    fn read_paths(&self, connection: &Connection) -> Option<ClipboardItem> {
+        if !self.has_mime_type(FILE_LIST_MIME_TYPE) {
+            return None;
+        }
+        let bytes = self.read_bytes(connection, FILE_LIST_MIME_TYPE)?;
+        let text = String::from_utf8(bytes).ok()?;
+        let paths = text
+            .lines()
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| Url::parse(line).ok()?.to_file_path().ok())
+            .collect::<SmallVec<[PathBuf; 2]>>();
+        if paths.is_empty() {
+            return None;
+        }
+        Some(ClipboardItem {
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))],
+        })
     }
 }
 
@@ -180,19 +221,81 @@ impl Clipboard {
         self.self_mime.clone()
     }
 
-    pub fn send(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self.contents.as_ref().and_then(|contents| contents.text()) {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn mime_types(&self) -> Vec<String> {
+        let Some(contents) = self.contents.as_ref() else {
+            return Vec::new();
+        };
+        let mut mime_types = Vec::new();
+        if contents
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::String(_)))
+        {
+            mime_types.extend(TEXT_MIME_TYPES.map(str::to_owned));
         }
+        if contents.entries.iter().any(|entry| {
+            matches!(entry, ClipboardEntry::ExternalPaths(paths) if !file_uri_list(paths).is_empty())
+        }) {
+            mime_types.push(FILE_LIST_MIME_TYPE.to_owned());
+        }
+        for entry in &contents.entries {
+            let ClipboardEntry::Image(image) = entry else {
+                continue;
+            };
+            let mime_type = image.format.mime_type().to_owned();
+            if !mime_types.contains(&mime_type) {
+                mime_types.push(mime_type);
+            }
+        }
+        mime_types
     }
 
-    pub fn send_primary(&self, _mime_type: String, fd: OwnedFd) {
-        if let Some(text) = self
-            .primary_contents
-            .as_ref()
-            .and_then(|contents| contents.text())
-        {
-            self.send_bytes(fd, text.as_bytes().to_owned());
+    pub fn send(&self, mime_type: String, fd: OwnedFd) {
+        let Some(contents) = self.contents.as_ref() else {
+            return;
+        };
+        self.send_item(contents, &mime_type, fd);
+    }
+
+    pub fn send_primary(&self, mime_type: String, fd: OwnedFd) {
+        let Some(contents) = self.primary_contents.as_ref() else {
+            return;
+        };
+        self.send_item(contents, &mime_type, fd);
+    }
+
+    fn send_item(&self, item: &ClipboardItem, mime_type: &str, fd: OwnedFd) {
+        let bytes = if TEXT_MIME_TYPES.contains(&mime_type) {
+            Some(
+                item.entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        ClipboardEntry::String(value) => Some(value.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>()
+                    .into_bytes(),
+            )
+        } else if mime_type == FILE_LIST_MIME_TYPE {
+            item.entries.iter().find_map(|entry| match entry {
+                ClipboardEntry::ExternalPaths(paths) => {
+                    let list = file_uri_list(paths);
+                    (!list.is_empty()).then(|| list.into_bytes())
+                }
+                _ => None,
+            })
+        } else {
+            ImageFormat::from_mime_type(mime_type).and_then(|format| {
+                item.entries.iter().find_map(|entry| match entry {
+                    ClipboardEntry::Image(image) if image.format == format => {
+                        Some(image.bytes.clone())
+                    }
+                    _ => None,
+                })
+            })
+        };
+        if let Some(bytes) = bytes {
+            self.send_bytes(fd, bytes);
         }
     }
 
@@ -208,7 +311,8 @@ impl Clipboard {
 
         let item = offer
             .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .or_else(|| offer.read_image(&self.connection))
+            .or_else(|| offer.read_paths(&self.connection))?;
 
         self.cached_read = Some(item.clone());
         Some(item)
@@ -226,7 +330,8 @@ impl Clipboard {
 
         let item = offer
             .read_text(&self.connection)
-            .or_else(|| offer.read_image(&self.connection))?;
+            .or_else(|| offer.read_image(&self.connection))
+            .or_else(|| offer.read_paths(&self.connection))?;
 
         self.cached_primary_read = Some(item.clone());
         Some(item)

@@ -19,7 +19,6 @@
 // https://freedesktop.org/wiki/ClipboardManager/
 
 use std::{
-    borrow::Cow,
     cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     sync::{
@@ -47,8 +46,10 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, Image, ImageFormat, hash};
+use smallvec::SmallVec;
 use strum::IntoEnumIterator;
+use url::Url;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -78,7 +79,7 @@ x11rb::atom_manager! {
         TEXT_MIME_UNKNOWN: b"text/plain",
 
         // HTML: b"text/html",
-        // URI_LIST: b"text/uri-list",
+        TextUriList: b"text/uri-list",
 
         PNG__MIME: ImageFormat::mime_type(ImageFormat::Png ).as_bytes(),
         JPEG_MIME: ImageFormat::mime_type(ImageFormat::Jpeg).as_bytes(),
@@ -977,16 +978,49 @@ impl Clipboard {
         Ok(Self { inner: ctx })
     }
 
-    pub(crate) fn set_text(
+    pub(crate) fn set_item(
         &self,
-        message: Cow<'_, str>,
+        item: &ClipboardItem,
         selection: ClipboardKind,
         wait: WaitConfig,
     ) -> Result<()> {
-        let data = vec![ClipboardData {
-            bytes: message.into_owned().into_bytes(),
-            format: self.inner.atoms.UTF8_STRING,
-        }];
+        let mut data = Vec::new();
+        let text_entries = item
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::String(value) => Some(value.text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        for entry in &item.entries {
+            match entry {
+                ClipboardEntry::Image(image) => data.push(ClipboardData {
+                    bytes: image.bytes.clone(),
+                    format: self.image_format_atom(image.format),
+                }),
+                ClipboardEntry::ExternalPaths(paths) => {
+                    let uris = file_uri_list(paths);
+                    if !uris.is_empty() {
+                        data.push(ClipboardData {
+                            bytes: uris.into_bytes(),
+                            format: self.inner.atoms.TextUriList,
+                        });
+                    }
+                }
+                ClipboardEntry::String(_) => {}
+            }
+        }
+        if item
+            .entries
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::String(_)))
+        {
+            data.push(ClipboardData {
+                bytes: text_entries.into_bytes(),
+                format: self.inner.atoms.UTF8_STRING,
+            });
+        }
         self.inner.write(data, selection, wait)
     }
 
@@ -1014,7 +1048,7 @@ impl Clipboard {
         let format = self.image_format_atom(image.format);
         let data = vec![ClipboardData {
             bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
+            format,
         }];
         self.inner.write(data, selection, wait)
     }
@@ -1025,6 +1059,7 @@ impl Clipboard {
             .collect::<Vec<_>>();
 
         let text_format_atoms: &[Atom] = &[
+            self.inner.atoms.TextUriList,
             self.inner.atoms.UTF8_STRING,
             self.inner.atoms.UTF8_MIME_0,
             self.inner.atoms.UTF8_MIME_1,
@@ -1058,6 +1093,21 @@ impl Clipboard {
             }
         }
 
+        if result.format == self.inner.atoms.TextUriList {
+            let text = String::from_utf8(result.bytes).map_err(|_| Error::ConversionFailure)?;
+            let paths = text
+                .lines()
+                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+                .filter_map(|line| Url::parse(line).ok()?.to_file_path().ok())
+                .collect::<SmallVec<[_; 2]>>();
+            if paths.is_empty() {
+                return Err(Error::ConversionFailure);
+            }
+            return Ok(ClipboardItem {
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))],
+            });
+        }
+
         let text = if result.format == self.inner.atoms.STRING {
             // ISO Latin-1
             // See: https://stackoverflow.com/questions/28169745/what-are-the-options-to-convert-iso-8859-1-latin-1-to-a-string-utf-8
@@ -1071,6 +1121,18 @@ impl Clipboard {
     pub fn is_owner(&self, selection: ClipboardKind) -> bool {
         self.inner.is_owner(selection).unwrap_or(false)
     }
+}
+
+fn file_uri_list(paths: &ExternalPaths) -> String {
+    paths
+        .0
+        .iter()
+        .filter_map(|path| Url::from_file_path(path).ok())
+        .fold(String::new(), |mut list, url| {
+            list.push_str(url.as_str());
+            list.push_str("\r\n");
+            list
+        })
 }
 
 impl Drop for Clipboard {

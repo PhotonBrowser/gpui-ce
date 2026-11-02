@@ -151,6 +151,7 @@ objc2-foundation = { version = "=0.3.2", default-features = false, features = [
   "objc2-core-foundation",
   "std",
 ] }
+objc2-uniform-type-identifiers = { version = "0.3", default-features = false, features = ["std", "UTType", "UTCoreTypes"] }
 objc2-user-notifications = "0.3"
 mach2 = "0.5"
 metal = "0.33"
@@ -205,6 +206,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
   "NSMenu",
   "NSMenuItem",
   "NSOpenPanel",
+  "objc2-uniform-type-identifiers",
   "NSSavePanel",
   "NSScroller",
   "NSWorkspace",

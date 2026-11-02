@@ -828,6 +828,10 @@ impl Platform for MacPlatform {
 
                     panel.setCanCreateDirectories(true);
                     panel.setResolvesAliases(false);
+                    let content_types = content_types(&options.file_types);
+                    if !content_types.is_empty() {
+                        panel.setAllowedContentTypes(&NSArray::from_retained_slice(&content_types));
+                    }
                     let panel_for_callback = panel.clone();
                     let done_tx = Cell::new(Some(done_tx));
                     let block = RcBlock::new(move |response: objc2_app_kit::NSModalResponse| {
@@ -1700,4 +1704,59 @@ mod security {
     pub const errSecSuccess: OSStatus = 0;
     pub const errSecUserCanceled: OSStatus = -128;
     pub const errSecItemNotFound: OSStatus = -25300;
+}
+
+/// The uniform types for a prompt's file types, skipping any that macOS does
+/// not recognise.
+fn content_types(
+    file_types: &[gpui::SharedString],
+) -> Vec<objc2::rc::Retained<objc2_uniform_type_identifiers::UTType>> {
+    use objc2_uniform_type_identifiers::UTType;
+    file_types
+        .iter()
+        .filter_map(|kind| {
+            let kind = kind.trim().to_ascii_lowercase();
+            if let Some(extension) = kind.strip_prefix('.') {
+                return UTType::typeWithFilenameExtension(&ns_string(extension));
+            }
+            let family = match kind.strip_suffix("/*") {
+                Some("image") => Some(unsafe { objc2_uniform_type_identifiers::UTTypeImage }),
+                Some("audio") => Some(unsafe { objc2_uniform_type_identifiers::UTTypeAudio }),
+                Some("video") => Some(unsafe { objc2_uniform_type_identifiers::UTTypeMovie }),
+                Some("text") => Some(unsafe { objc2_uniform_type_identifiers::UTTypeText }),
+                Some(_) => return None,
+                None => None,
+            };
+            match family {
+                Some(family) => Some(objc2::Message::retain(family)),
+                None => UTType::typeWithMIMEType(&ns_string(&kind)),
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::content_types;
+
+    #[test]
+    fn maps_extensions_mime_types_and_families() {
+        let identifiers = |kinds: &[&str]| {
+            let kinds: Vec<gpui::SharedString> = kinds.iter().map(|kind| (*kind).into()).collect();
+            content_types(&kinds)
+                .iter()
+                .map(|kind| kind.identifier().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            identifiers(&[".PDF", "image/*", "image/png", "video/*"]),
+            [
+                "com.adobe.pdf",
+                "public.image",
+                "public.png",
+                "public.movie"
+            ]
+        );
+        assert!(identifiers(&["font/*"]).is_empty());
+    }
 }

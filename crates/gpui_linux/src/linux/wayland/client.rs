@@ -96,7 +96,7 @@ use crate::linux::{
     modifiers_from_xkb, new_xkb_context, open_uri_internal, read_fd_with_timeout,
     reveal_path_internal,
     wayland::{
-        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE, TEXT_MIME_TYPES},
+        clipboard::{Clipboard, DataOffer, FILE_LIST_MIME_TYPE},
         cursor::Cursor,
         serial::{Serial, SerialKind, SerialTracker},
         to_shape,
@@ -1255,8 +1255,8 @@ impl LinuxClient for WaylandClient {
                 return;
             };
             let data_source = primary_selection_manager.create_source(&state.globals.qh, ());
-            for mime_type in TEXT_MIME_TYPES {
-                data_source.offer(mime_type.to_string());
+            for mime_type in state.clipboard.mime_types() {
+                data_source.offer(mime_type);
             }
             data_source.offer(state.clipboard.self_mime());
             primary_selection.set_selection(Some(&data_source), serial.as_raw());
@@ -1281,8 +1281,8 @@ impl LinuxClient for WaylandClient {
             };
             let data_source = data_device_manager
                 .create_data_source(&state.globals.qh, DataSourceKind::Clipboard);
-            for mime_type in TEXT_MIME_TYPES {
-                data_source.offer(mime_type.to_string());
+            for mime_type in state.clipboard.mime_types() {
+                data_source.offer(mime_type);
             }
             data_source.offer(state.clipboard.self_mime());
             data_device.set_selection(Some(&data_source), serial.as_raw());

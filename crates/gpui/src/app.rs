@@ -817,6 +817,27 @@ pub struct App {
     _ref_counts: Arc<RwLock<EntityRefCounts>>,
 }
 
+/// A cloneable handle for clipboard access without borrowing a GPUI `App`.
+///
+/// Clipboard operations must run on the application's main thread. This is
+/// useful for native callbacks that run while the `App` is already borrowed.
+#[derive(Clone)]
+pub struct ClipboardHandle {
+    platform: Rc<dyn Platform>,
+}
+
+impl ClipboardHandle {
+    /// Reads the current platform clipboard contents.
+    pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
+        self.platform.read_from_clipboard()
+    }
+
+    /// Writes contents to the platform clipboard.
+    pub fn write_to_clipboard(&self, item: ClipboardItem) {
+        self.platform.write_to_clipboard(item)
+    }
+}
+
 impl App {
     #[allow(clippy::new_ret_no_self)]
     pub(crate) fn new_app(
@@ -1484,6 +1505,14 @@ impl App {
     /// Reads data from the platform clipboard.
     pub fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         self.platform.read_from_clipboard()
+    }
+
+    /// Returns a cloneable clipboard handle that can be used without borrowing
+    /// this `App` again.
+    pub fn clipboard_handle(&self) -> ClipboardHandle {
+        ClipboardHandle {
+            platform: self.platform.clone(),
+        }
     }
 
     /// Reads data from the platform clipboard, resolving once the contents

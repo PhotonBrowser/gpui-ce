@@ -3268,6 +3268,11 @@ pub struct PathPromptOptions {
     pub multiple: bool,
     /// The prompt to show to a user when selecting a path
     pub prompt: Option<SharedString>,
+    /// The kinds of file that may be selected, each a filename extension
+    /// with its leading dot (`.pdf`), a MIME type (`image/png`), or a MIME
+    /// type family (`image/*`). Empty allows any file, as does a list with no
+    /// kind the platform recognises. Platforms that cannot filter ignore it.
+    pub file_types: Vec<SharedString>,
 }
 
 /// What kind of prompt styling to show
